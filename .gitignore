@@ -1,61 +1,80 @@
 # ===============================================
-# Project-specific files for GoPhantom
+# GoPhantom .gitignore
 # ===============================================
 
-# Final compiled loader
-FinalLoader.exe
-hello.exe
+# -----------------------------------------------
+# 编译输出目录（通过 Release 分发）
+# -----------------------------------------------
+dist/
 
-# Multi-platform binaries (should be distributed via Release page)
-GoPhantom-v*
-GoPhantom-v*.exe
-GoPhantom-v*-linux
-GoPhantom-v*-macos-*
-GoPhantom-v*-windows-*
+# -----------------------------------------------
+# 测试样例目录（用户自行提供）
+# -----------------------------------------------
+samples/
 
-# Build scripts
-build.sh
-build.bat
-
-# Example payload and decoy files
-# These should be provided by the user, not stored in the repo.
-beacon_x64.bin
-calc_x64.bin
-info.txt
-
-# JetBrains IDE directory
-.idea/
-
-# ===============================================
-# General Go community template
-# From: https://github.com/github/gitignore
-# ===============================================
-
-# Binaries for programs and plugins
+# -----------------------------------------------
+# 通用二进制文件
+# -----------------------------------------------
 *.exe
 *.exe~
 *.dll
 *.so
 *.dylib
+*.bin
 
-# Test binary, built with `go test -c`
+# 未版本化的编译产物
+GoPhantom
+GoPhantom-*
+
+# -----------------------------------------------
+# Go 相关
+# -----------------------------------------------
+# 测试二进制文件
 *.test
 
-# Code coverage profiles and other test artifacts
+# 代码覆盖率
 *.out
 coverage.*
 *.coverprofile
 profile.cov
 
-# Dependency directories
-# vendor/
+# -----------------------------------------------
+# IDE 和编辑器
+# -----------------------------------------------
+# JetBrains
+.idea/
+*.iml
 
-# Go workspace file
-go.work
-go.work.sum
+# VS Code
+.vscode/
+*.code-workspace
 
-# env file
-.env
+# Vim
+*.swp
+*.swo
+*~
 
-# macOS specific files
+# -----------------------------------------------
+# 系统文件
+# -----------------------------------------------
+# macOS
 .DS_Store
+.AppleDouble
+.LSOverride
+._*
+
+# Windows
+Thumbs.db
+ehthumbs.db
+Desktop.ini
+
+# Linux
+*~
+
+# -----------------------------------------------
+# 临时文件
+# -----------------------------------------------
+*.tmp
+*.temp
+*.log
+*.bak

