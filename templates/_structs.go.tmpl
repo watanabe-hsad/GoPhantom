@@ -1,0 +1,108 @@
+{{define "_structs"}}
+// ============================================================
+// Windows 结构体（顶层定义，避免重复）
+// ============================================================
+type SYSTEM_INFO struct {
+	ProcessorArchitecture     uint16
+	Reserved                  uint16
+	PageSize                  uint32
+	MinimumApplicationAddress uintptr
+	MaximumApplicationAddress uintptr
+	ActiveProcessorMask       uintptr
+	NumberOfProcessors        uint32
+	ProcessorType             uint32
+	AllocationGranularity     uint32
+	ProcessorLevel            uint16
+	ProcessorRevision         uint16
+}
+
+type MEMORYSTATUSEX struct {
+	Length               uint32
+	MemoryLoad           uint32
+	TotalPhys            uint64
+	AvailPhys            uint64
+	TotalPageFile        uint64
+	AvailPageFile        uint64
+	TotalVirtual         uint64
+	AvailVirtual         uint64
+	AvailExtendedVirtual uint64
+}
+
+type LASTINPUTINFO struct {
+	CbSize uint32
+	DwTime uint32
+}
+
+type PROCESSENTRY32W struct {
+	Size              uint32
+	CntUsage          uint32
+	ProcessID         uint32
+	DefaultHeapID     uintptr
+	ModuleID          uint32
+	Threads           uint32
+	ParentProcessID   uint32
+	PriClassBase      int32
+	Flags             uint32
+	ExeFile           [260]uint16
+}
+
+// PE 结构体（用于 NTDLL unhooking）
+type IMAGE_DOS_HEADER struct {
+	Magic  uint16
+	_      [58]byte
+	LfaNew uint32
+}
+
+type IMAGE_FILE_HEADER struct {
+	Machine              uint16
+	NumberOfSections     uint16
+	TimeDateStamp        uint32
+	PointerToSymbolTable uint32
+	NumberOfSymbols      uint32
+	SizeOfOptionalHeader uint16
+	Characteristics      uint16
+}
+
+type IMAGE_OPTIONAL_HEADER struct {
+	Magic               uint16
+	_                   [14]byte
+	AddressOfEntryPoint uint32
+	BaseOfCode          uint32
+	ImageBase           uint64
+	SectionAlignment    uint32
+	FileAlignment       uint32
+	_                   [20]byte
+	SizeOfImage         uint32
+	SizeOfHeaders       uint32
+	CheckSum            uint32
+	Subsystem           uint16
+	DllCharacteristics  uint16
+	_                   [40]byte
+	NumberOfRvaAndSizes uint32
+	DataDirectory       [16]IMAGE_DATA_DIRECTORY
+}
+
+type IMAGE_NT_HEADERS struct {
+	Signature      uint32
+	FileHeader     IMAGE_FILE_HEADER
+	OptionalHeader IMAGE_OPTIONAL_HEADER
+}
+
+type IMAGE_DATA_DIRECTORY struct {
+	VirtualAddress uint32
+	Size           uint32
+}
+
+type IMAGE_SECTION_HEADER struct {
+	Name                 [8]byte
+	VirtualSize          uint32
+	VirtualAddress       uint32
+	SizeOfRawData        uint32
+	PointerToRawData     uint32
+	PointerToRelocations uint32
+	PointerToLinenumbers uint32
+	NumberOfRelocations  uint16
+	NumberOfLinenumbers  uint16
+	Characteristics      uint32
+}
+{{end}}

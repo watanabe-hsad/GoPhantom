@@ -1,0 +1,55 @@
+{{define "_crypto"}}
+// ============================================================
+// 解密函数
+// ============================================================
+
+func decryptAESGCM(encodedCiphertext, encodedSalt string) ([]byte, error) {
+	salt, err := base64.StdEncoding.DecodeString(encodedSalt)
+	if err != nil {
+		return nil, err
+	}
+	password := []byte{103, 111, 112, 104, 97, 110, 116, 111, 109, 45, 115, 116, 97, 116, 105, 99, 45, 115, 101, 99, 114, 101, 116, 45, 102, 111, 114, 45, 100, 101, 114, 105, 118, 97, 116, 105, 111, 110}
+	key := argon2.IDKey(password, salt, 1, 64*1024, 4, 32)
+
+	ciphertext, err := base64.StdEncoding.DecodeString(encodedCiphertext)
+	if err != nil {
+		return nil, err
+	}
+	block, err := aes.NewCipher(key)
+	if err != nil {
+		return nil, err
+	}
+	gcm, err := cipher.NewGCM(block)
+	if err != nil {
+		return nil, err
+	}
+	nonceSize := gcm.NonceSize()
+	if len(ciphertext) < nonceSize {
+		return nil, err
+	}
+	nonce, ciphertext := ciphertext[:nonceSize], ciphertext[nonceSize:]
+	plaintext, err := gcm.Open(nil, nonce, ciphertext, nil)
+	if err != nil {
+		return nil, err
+	}
+
+	if enableCompress {
+		reader, err := zlib.NewReader(bytes.NewReader(plaintext))
+		if err != nil {
+			return nil, err
+		}
+		defer reader.Close()
+		plaintext, err = io.ReadAll(reader)
+		if err != nil {
+			return nil, err
+		}
+	}
+
+	// XOR 解密层
+	xorKey := key[:8]
+	for i := range plaintext {
+		plaintext[i] ^= xorKey[i%8]
+	}
+	return plaintext, nil
+}
+{{end}}

