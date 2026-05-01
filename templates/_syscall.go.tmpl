@@ -231,39 +231,36 @@ func indirectSyscall(sysNumber uint16, gadgetAddr uintptr, args ...uintptr) (uin
 		return 0, nil
 	}
 
-	// 构造 trampoline 机器码
-	// 4C 8B D1             = mov r10, rcx
-	// B8 XX XX 00 00       = mov eax, <syscall number>
-	// 49 BB <8 bytes>      = mov r11, <gadget address>
-	// 41 FF E3             = jmp r11
-	trampoline := [20]byte{
-		0x4C, 0x8B, 0xD1,                         // mov r10, rcx
-		0xB8, byte(sysNumber), byte(sysNumber >> 8), 0x00, 0x00, // mov eax, number
-		0x49, 0xBB, 0, 0, 0, 0, 0, 0, 0, 0,      // mov r11, gadget (填充下面)
-		0x41, 0xFF, // jmp r11 的前两字节
-	}
-	// 注意：20 字节数组，最后需要 0xE3
-	// 重新定义为 slice 以便精确控制
-	trampolineBytes := make([]byte, 20)
-	copy(trampolineBytes, trampoline[:18])
-	trampolineBytes[18] = 0xFF
-	trampolineBytes[19] = 0xE3
+	// ── Indirect Syscall Trampoline (21 字节) ──
+	//
+	// 布局（x64）：
+	//   [0-2]   4C 8B D1              mov  r10, rcx          ; Windows syscall ABI: 第1参数
+	//   [3-7]   B8 XX XX 00 00        mov  eax, <number>     ; syscall number
+	//   [8-17]  49 BB <8B gadget>     mov  r11, <gadget>     ; ntdll 内 syscall;ret 地址
+	//   [18-20] 41 FF E3              jmp  r11               ; 跳转执行
+	//
+	// 执行流：
+	//   syscall.Syscall CALL trampoline → trampoline 设置 r10/eax → jmp ntdll gadget
+	//   → syscall 指令在 ntdll .text 段内执行（规避 unbacked caller 检测）
+	//   → ret 返回到 syscall.Syscall 的调用者
+	//
+	// 安全性：
+	//   - syscall 指令地址在 ntdll .text 段内，避免从自建内存页直接执行 syscall
+	//   - trampoline 使用后立即清零释放，不留内存特征
+	//   - 不修改 rsp，栈帧完全由 Go runtime 管理，无平衡风险
 
-	// 修正：重新构造完整的 trampoline
-	trampolineBytes[0] = 0x4C; trampolineBytes[1] = 0x8B; trampolineBytes[2] = 0xD1
-	trampolineBytes[3] = 0xB8
-	trampolineBytes[4] = byte(sysNumber)
-	trampolineBytes[5] = byte(sysNumber >> 8)
-	trampolineBytes[6] = 0x00; trampolineBytes[7] = 0x00
-	trampolineBytes[8] = 0x49; trampolineBytes[9] = 0xBB
-	// 填充 gadget 地址（小端序 8 字节）
+	trampolineBytes := make([]byte, 0, 21)
+	// mov r10, rcx
+	trampolineBytes = append(trampolineBytes, 0x4C, 0x8B, 0xD1)
+	// mov eax, <number>
+	trampolineBytes = append(trampolineBytes, 0xB8, byte(sysNumber), byte(sysNumber>>8), 0x00, 0x00)
+	// mov r11, <gadget>
+	trampolineBytes = append(trampolineBytes, 0x49, 0xBB)
 	for i := 0; i < 8; i++ {
-		trampolineBytes[10+i] = byte(gadgetAddr >> (i * 8))
+		trampolineBytes = append(trampolineBytes, byte(gadgetAddr>>(i*8)))
 	}
-	trampolineBytes[18] = 0x41
-	trampolineBytes[19] = 0xFF
-	// 需要第 20 字节 0xE3，扩展到 21 字节
-	trampolineBytes = append(trampolineBytes, 0xE3)
+	// jmp r11
+	trampolineBytes = append(trampolineBytes, 0x41, 0xFF, 0xE3)
 
 	// 分配 RWX 内存放置 trampoline
 	// 使用 VirtualAlloc 而非 Nt* 避免递归调用 indirect syscall

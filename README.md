@@ -1,308 +1,285 @@
 # GoPhantom
 
-[![Go Version](https://img.shields.io/badge/Go-1.21%2B-blue.svg)](https://go.dev/)
+[![Go](https://img.shields.io/badge/Go-1.21+-blue.svg)](https://go.dev/)
 [![Target](https://img.shields.io/badge/target-windows%2Famd64-blue.svg)](https://learn.microsoft.com/windows/)
 [![License](https://img.shields.io/badge/license-MIT-green.svg)](LICENSE)
 
-**GoPhantom** 是一个基于 Go 的 Windows Loader 生成器，面向授权红队演练、受控安全研究和防御技术验证场景。它通过模板化构建流程，将输入的 payload 与诱饵文件打包为 `windows/amd64` 可执行文件。
+Go 语言 Windows Loader 生成器。模板化构建，参数驱动，面向授权红队演练与防御验证。
 
-这个项目现在更偏向一个可维护的工程工具，而不是一次性脚本：命令行配置集中管理，Loader 源码由多个模板组合生成，测试会覆盖典型模板组合并进行交叉编译校验。
+> 仅限自有环境、授权实验室或书面授权的安全评估使用。
 
-> **使用边界**：本项目仅限在自有环境、授权实验室或明确书面授权的安全评估中使用。请勿将其用于第三方系统、网络、设备或用户。
+---
 
-## 当前状态
+## 概览
 
-| 项目 | 状态 |
-| --- | --- |
-| 开发语言 | Go 1.21+ |
-| 生成目标 | `windows/amd64` |
-| 构建平台 | macOS、Linux、Windows 均可交叉编译 |
-| 测试命令 | `go test ./...` |
-| 模板覆盖 | 默认模式、env-bind、indirect-syscall、module-stomping、mem-obf、evasion snippets 等组合 |
-| 可复现构建 | 通过 `GOPHANTOM_SALT` 支持，包括 env-bind salt 与构建期随机选择 |
+GoPhantom 将 payload 与诱饵文件打包为 `windows/amd64` 可执行文件。生成器在 macOS / Linux / Windows 上交叉编译，输出的 Loader 在目标 Windows 系统上运行。
 
-## 设计目标
+核心设计：
 
-- 让生成器行为尽量显式、可测、可回归。
-- 用清晰的 flag 管理 Loader 变体，避免手工改模板。
-- 保证模板组合在功能扩展后仍能编译通过。
-- 文档与测试状态保持一致，不夸大实际能力。
-- 将使用场景限定在授权研究、内部验证和实验室环境。
+- 所有变体通过 CLI flag 控制，无需手工改模板
+- 每次构建自动注入多态代码，默认产生不同的文件哈希；设置 `GOPHANTOM_SALT` 可切换为确定性构建
+- 模板组合均有交叉编译回归测试覆盖
 
-## 架构概览
+---
 
-GoPhantom 采用两阶段模型：生成阶段和运行阶段。
+## 功能
 
-```text
-输入文件 + 命令行参数
-        |
-        v
-generator.go
-  - 参数校验
-  - 读取输入文件
-  - 派生构建密钥与 salt
-  - 渲染 Loader 模板
-  - 交叉编译 windows/amd64
-        |
-        v
-生成 loader.exe
-```
+### 加密与混淆
 
-### 主要组件
+| 能力 | 参数 | 说明 |
+|---|---|---|
+| AES-256-GCM 加密 | 默认 | Argon2id 派生密钥，XOR + zlib + AEAD 三层封装 |
+| ChaCha20-Poly1305 | `-env-bind` | 环境绑定模式下自动切换 |
+| 字符串 XOR 编码 | 自动 | 所有敏感 API / DLL 名编译时编码，运行时解码 |
+| AMSI patch 多态 | 自动 | 每次构建随机选择等效 patch 字节 |
+| 多态代码注入 | 自动 | 3-7 个随机垃圾函数，改变控制流图与文件哈希 |
+| Garble 编译期混淆 | `-garble` | 控制流扁平化、符号重命名、字符串字面量加密（需 Go 1.26+） |
 
-| 路径 | 说明 |
-| --- | --- |
-| `generator.go` | CLI 入口、配置校验、资产准备、模板渲染与交叉编译编排 |
-| `internal/keymgr/` | 密钥和 salt 派生逻辑，包含可复现构建与测试用随机源注入 |
-| `internal/knowledge/` | 可选技术片段的结构化元数据 |
-| `templates/loader.go.tmpl` | 生成 Loader 的顶层模板 |
-| `templates/_crypto.go.tmpl` | 运行时解密与环境绑定密钥重建逻辑 |
-| `templates/_execute.go.tmpl` | 运行时执行路径模板 |
-| `templates/_sandbox.go.tmpl` | 环境评分检测逻辑 |
-| `templates/_syscall.go.tmpl` | 可选 syscall 支持代码 |
-| `templates/_cleanup.go.tmpl` | 可选清理逻辑 |
-| `generator_test.go` | 配置校验、可复现构建、模板渲染与交叉编译回归测试 |
+### 执行与注入
 
-## 功能矩阵
+| 能力 | 参数 | 说明 |
+|---|---|---|
+| 本地线程执行 | 默认 | VirtualAlloc → 写入 → VirtualProtect → CreateThread |
+| 远程线程注入 | `-inject-mode=inject` | 目标进程 VirtualAllocEx + CreateRemoteThread |
+| Early Bird APC | `-inject-mode=earlybird` | 挂起进程 + NtQueueApcThreadEx |
+| Module Stomping | `-stomp-dll` | 覆写合法 DLL .text 段，MEM_IMAGE 伪装，自动回退候选 DLL |
+| 回调执行 | 自动回退 | EnumChildWindows 回调作为备选执行路径 |
 
-| 功能 | 参数 | 说明 | 测试覆盖 |
-| --- | --- | --- | --- |
-| zlib 压缩 | `-compress` | 默认开启，用于嵌入数据预处理 | 模板编译覆盖 |
-| 延迟执行 | `-delay` | 配置运行时延迟秒数 | 配置/模板数据覆盖 |
-| 睡眠混淆 | `-obfuscate` | 生成可选运行时代码路径 | 默认模板数据覆盖 |
-| payload 变异 | `-mutate` | 生成可选运行时代码路径 | 默认模板数据覆盖 |
-| 执行模式 | `-inject-mode` | 支持默认、`inject`、`earlybird` | 配置校验覆盖 |
-| 旧版注入参数 | `-inject` / `-earlybird` | 自动映射到 `-inject-mode` | 配置校验覆盖 |
-| 自删除标记 | `-self-delete` | 生成可选清理模板 | 模板编译覆盖 |
-| indirect syscall | `-indirect-syscall` | 生成可选支持代码 | 编译测试覆盖 |
-| module stomping | `-stomp-dll` | 针对指定 DLL 生成可选路径 | 编译测试覆盖 |
-| 环境绑定加密 | `-env-bind` | 根据声明的环境特征派生运行时密钥 | 确定性行为测试覆盖 |
-| 内存权限混淆 | `-mem-obf` | 生成可选权限切换路径 | 编译测试覆盖 |
-| 技术片段选择 | `-evasion-techs` | 从 `internal/knowledge` 选择片段 | 编译测试覆盖 |
+### 防御绕过
 
-## 安装与构建
+| 能力 | 参数 | 说明 |
+|---|---|---|
+| NTDLL 脱钩 | 自动 | 从磁盘读取干净 ntdll 覆盖内存 .text 段 |
+| ETW 禁用 | 自动 | patch EtwEventWrite + NtTraceEvent |
+| AMSI 禁用 | 自动 | patch AmsiScanBuffer 入口 |
+| Indirect Syscall | `-indirect-syscall` | Hell's Gate / Halo's Gate + ntdll gadget 间接调用 |
+| 内存权限混淆 | `-mem-obf` | RW → NoAccess → RX 三步翻转，打破 W→X 检测模式 |
+| 睡眠混淆 | `-obfuscate` | sleep 期间 XOR 加密 shellcode 内存 |
+| 环境绑定 | `-env-bind` | 运行时校验主机特征，非目标环境静默退出 |
+| 反沙箱 | 自动 | 加权评分制环境检测（CPU / 内存 / 磁盘 / 调试器 / VM） |
 
-环境要求：
+### 可选技术片段 (`-evasion-techs`)
 
-- Go 1.21 或更高版本
-- 支持 Go 交叉编译到 `windows/amd64`
+| ID | 名称 | 类别 |
+|---|---|---|
+| T001 | API Hashing (djb2) | API 混淆 |
+| T002 | 双重 XOR 字符串混淆 | 字符串防御 |
+| T003 | Direct Syscall 解析 | Hook 绕过 |
+| T004 | Sleep 内存加密 | 内存规避 |
+| T005 | 环境指纹校验 | 沙箱检测 |
+| T006 | 硬件断点 AMSI Bypass（VEH + DR0） | Hook 绕过 |
+| T007 | NtTraceControl ETW Blind | Hook 绕过 |
 
-构建生成器：
+---
+
+## 快速开始
+
+### 环境要求
+
+- Go 1.21+（基础功能）
+- Go 1.26+（仅 `-garble` 需要）
+- 支持交叉编译到 `windows/amd64`
+
+### 构建与使用
 
 ```bash
-go build -ldflags "-s -w" -o GoPhantom generator.go
+# 构建生成器
+go build -o GoPhantom .
+
+# 基础生成
+./GoPhantom -decoy doc.pdf -payload beacon.bin -out loader.exe
+
+# 完整能力组合
+./GoPhantom \
+  -decoy doc.pdf \
+  -payload beacon.bin \
+  -out loader.exe \
+  -indirect-syscall \
+  -stomp-dll winhttp.dll \
+  -mem-obf \
+  -obfuscate \
+  -mutate \
+  -evasion-techs=T001,T003,T006,T007 \
+  -env-bind hostname=TARGET-PC,domain=CORP \
+  -delay 15
+
+# 启用 Garble（需 Go 1.26+ 和 garble）
+go install mvdan.cc/garble@latest
+./GoPhantom -decoy doc.pdf -payload beacon.bin -out loader.exe -garble
 ```
 
-运行测试：
+`-out` 自动补齐 `.exe` 后缀。
 
-```bash
-go test ./...
-```
+---
 
-## 使用方法
+## 参数
 
-基础生成命令：
-
-```bash
-./GoPhantom -decoy ./fixtures/decoy.pdf -payload ./fixtures/payload.bin -out ./dist/loader.exe
-```
-
-`-out` 会自动补齐 `.exe` 后缀。例如传入 `./dist/loader` 时，实际输出为 `./dist/loader.exe`。
-
-### 必需参数
+### 必需
 
 | 参数 | 说明 |
-| --- | --- |
-| `-decoy` | 要嵌入生成 Loader 的诱饵文件路径 |
-| `-payload` | 要嵌入生成 Loader 的原始 payload 字节文件 |
-| `-out` | 生成的 Windows 可执行文件输出路径 |
+|---|---|
+| `-decoy` | 诱饵文件路径 |
+| `-payload` | 原始 shellcode 文件路径 |
+| `-out` | 输出可执行文件路径 |
 
-### 可选参数
+### 可选
 
-| 参数 | 默认值 | 说明 |
-| --- | --- | --- |
-| `-compress` | `true` | 加密前压缩嵌入数据 |
-| `-delay` | `0` | 运行时延迟秒数 |
-| `-obfuscate` | `false` | 包含可选睡眠混淆代码路径 |
-| `-mutate` | `false` | 包含可选 payload 变异代码路径 |
-| `-inject-mode` | 空 | 选择 `inject`、`earlybird` 或默认本地路径 |
-| `-self-delete` | `false` | 包含可选重启后清理标记 |
-| `-indirect-syscall` | `false` | 包含可选 indirect syscall 支持代码 |
-| `-stomp-dll` | 空 | 为指定 DLL 包含可选 module-stomping 路径 |
-| `-env-bind` | 空 | 将加密材料绑定到声明的环境特征 |
-| `-mem-obf` | `false` | 包含可选内存权限切换路径 |
-| `-evasion-techs` | 空 | 逗号分隔的技术 ID，如 `T001,T003` |
+| 参数 | 默认 | 说明 |
+|---|---|---|
+| `-compress` | `true` | zlib 压缩嵌入数据 |
+| `-delay` | `0` | 运行时延迟（秒） |
+| `-obfuscate` | `false` | 睡眠期间内存加密 |
+| `-mutate` | `false` | shellcode NOP 变异 |
+| `-inject-mode` | 空 | `inject` / `earlybird` / 默认本地线程 |
+| `-self-delete` | `false` | 重启时自删除 |
+| `-indirect-syscall` | `false` | Indirect Syscall 引擎（Hell's Gate / Halo's Gate） |
+| `-stomp-dll` | 空 | Module Stomping 牺牲 DLL（自动回退候选列表） |
+| `-env-bind` | 空 | 环境绑定 `key=value`（hostname / domain / username / hostsfile） |
+| `-mem-obf` | `false` | 三步内存权限翻转 |
+| `-evasion-techs` | 空 | 技术片段 ID，如 `T001,T003,T006,T007` |
+| `-garble` | `false` | Garble 编译期混淆（需 Go 1.26+，`go install mvdan.cc/garble@latest`） |
 
-旧版 `-inject` 与 `-earlybird` 仍然可用，会分别映射为 `-inject-mode=inject` 和 `-inject-mode=earlybird`。
+---
 
-### 示例
+## 环境绑定
 
-默认模式：
-
-```bash
-./GoPhantom -decoy doc.pdf -payload payload.bin -out loader.exe
-```
-
-指定执行模式：
-
-```bash
-./GoPhantom -decoy doc.pdf -payload payload.bin -out loader.exe -inject-mode=inject
-```
-
-组合多个可选能力：
+将加密密钥绑定到目标环境特征。运行时重新采集特征值，不匹配则静默退出。
 
 ```bash
 ./GoPhantom \
-  -decoy image.jpg \
-  -payload payload.bin \
-  -out advanced.exe \
-  -compress \
-  -obfuscate \
-  -mutate \
-  -inject-mode=earlybird \
-  -self-delete \
-  -delay 30
+  -decoy doc.pdf -payload beacon.bin -out loader.exe \
+  -env-bind hostname=DC01,domain=CORP.LOCAL
 ```
 
-## 可复现构建
+支持的特征：`hostname`、`domain`、`username`、`hostsfile`
 
-设置 `GOPHANTOM_SALT` 为 base64 编码的 16 字节值后，相同输入与相同参数会得到确定性的构建期随机选择。
+---
+
+## 确定性构建
 
 ```bash
 export GOPHANTOM_SALT="AAAAAAAAAAAAAAAAAAAAAA=="
-./GoPhantom -decoy ./fixtures/decoy.pdf -payload ./fixtures/payload.bin -out ./dist/repro.exe
+./GoPhantom -decoy doc.pdf -payload beacon.bin -out loader.exe
 ```
 
-确定性模式覆盖字符串 key、patch 变体选择、AEAD nonce，以及 env-bind 模式中的 salt 生成。未设置 `GOPHANTOM_SALT` 时，生成器会使用新鲜随机数，输出天然不可复现。
+设置相同 `GOPHANTOM_SALT` 后，生成阶段的随机材料会稳定派生：字符串 key、AMSI patch 选择、AEAD nonce、env-bind salt、多态函数生成等会保持一致。
 
-## 环境绑定模式
+注意：Go 链接器的 build id、临时构建路径和工具链细节可能导致最终 exe 不是 bit-for-bit 完全一致。因此这里承诺的是生成阶段随机材料可复现，而不是最终二进制哈希必然一致。
 
-`-env-bind` 接受逗号分隔的 `key=value` 列表。当前支持的 key：
+`-garble` 与确定性构建兼容：设置 `GOPHANTOM_SALT` 时，garble seed 从 SALT 派生；未设置时使用随机 seed。
 
-- `hostname`
-- `domain`
-- `username`
-- `hostsfile`
+---
 
-示例：
+## 架构
 
-```bash
-./GoPhantom \
-  -decoy ./fixtures/decoy.pdf \
-  -payload ./fixtures/payload.bin \
-  -out ./dist/env-bound.exe \
-  -env-bind hostname=LAB-WIN11,domain=LAB
+```text
+输入文件 + CLI 参数
+       │
+       ▼
+  generator.go
+  ├─ 参数校验
+  ├─ 密钥派生 (Argon2id / ChaCha20)
+  ├─ 资产加密 (AES-GCM / XChaCha20-Poly1305)
+  ├─ 多态代码生成
+  ├─ 模板渲染 (Go text/template)
+  └─ 交叉编译 (go build / garble build)
+       │
+       ▼
+  loader.exe (windows/amd64)
 ```
 
-生成器会校验特征名，并将特征列表及期望键值集合的哈希写入模板。运行时会重新采集声明的特征值，只有派生结果匹配时才继续后续流程。
-
-## 开发流程
-
-推荐的本地检查：
-
-```bash
-gofmt -w generator.go generator_test.go internal/keymgr/keymgr.go internal/keymgr/keymgr_test.go internal/knowledge/techniques.go
-go test ./...
-```
-
-添加新 flag 或模板能力时，建议同步更新：
-
-1. `generator.go` 中的 `Config`
-2. `registerFlags`
-3. `Config.Validate`
-4. `Config.Features`
-5. 需要传入模板时更新 `TemplateData`
-6. `generator_test.go` 中的编译测试或单元测试
-7. README 中的功能矩阵
-
-## 测试策略
-
-测试分两层：
-
-- 快速单元测试：覆盖配置校验、确定性随机源、env-bind 解析、输出路径规范化、模板数据构造等。
-- 模板编译测试：渲染代表性 Loader 组合，并交叉编译为 `windows/amd64`，防止模板组合在编译期失效。
-
-这对本项目很重要，因为很多回归不是普通 Go 包编译失败，而是模板渲染后才会暴露。
-
-## 演示截图
-
-### 生成过程
-
-![生成过程](image/img_1.png)
-
-### 检测效果示例
-
-![检测效果示例](image/img_2.png)
-
-### 执行效果
-
-在授权测试环境中执行生成的 Loader：
-
-- 自动释放并打开诱饵文件
-- 后续逻辑在后台按配置继续执行
-
-![执行效果](image/img.png)
-
-## 项目结构
+### 项目结构
 
 ```text
 GoPhantom/
-├── generator.go              # 生成器主程序
-├── generator_test.go         # 配置、模板渲染与交叉编译测试
+├── generator.go                # 生成器入口：CLI、校验、加密、模板渲染、编译
+├── generator_test.go           # 配置校验 + 模板编译回归测试（含 T001-T007 组合）
 ├── build/
-│   ├── go.mod.tmpl           # 临时构建模块 go.mod
-│   └── go.sum                # 临时构建模块 go.sum
+│   ├── go.mod.tmpl             # 临时构建模块
+│   └── go.sum
 ├── templates/
-│   ├── loader.go.tmpl        # 主模板：常量、import、main
-│   ├── _structs.go.tmpl      # Windows 结构体定义
-│   ├── _infra.go.tmpl        # DLL 缓存、工具函数、字符串解码
-│   ├── _bypass.go.tmpl       # 运行时相关模板
-│   ├── _sandbox.go.tmpl      # 加权评分制环境检测
-│   ├── _crypto.go.tmpl       # 解密与环境绑定密钥重建
-│   ├── _execute.go.tmpl      # 执行路径模板
-│   ├── _syscall.go.tmpl      # 可选 syscall 支持
-│   ├── _stomping.go.tmpl     # 可选 module-stomping 路径
-│   ├── _cleanup.go.tmpl      # 可选清理逻辑
-│   └── _camouflage.go.tmpl   # 行为伪装相关模板
+│   ├── loader.go.tmpl          # 主模板：常量、import、main、多态函数
+│   ├── _structs.go.tmpl        # Windows PE / API 结构体
+│   ├── _infra.go.tmpl          # DLL 缓存、字符串解码、工具函数
+│   ├── _bypass.go.tmpl         # NTDLL 脱钩、ETW/AMSI patch
+│   ├── _sandbox.go.tmpl        # 加权评分制反沙箱
+│   ├── _crypto.go.tmpl         # AES-GCM / ChaCha20 解密 + env-bind 密钥重建
+│   ├── _execute.go.tmpl        # 执行路径 + 内存权限混淆
+│   ├── _syscall.go.tmpl        # Indirect Syscall 引擎（Hell's Gate / Halo's Gate）
+│   ├── _stomping.go.tmpl       # Module Stomping（智能 DLL 回退选择）
+│   ├── _evasion.go.tmpl        # 用户选择的技术片段入口
+│   ├── _camouflage.go.tmpl     # 行为伪装 + IAT 填充
+│   └── _cleanup.go.tmpl        # 自删除逻辑
 ├── internal/
-│   ├── keymgr/               # 密钥管理与测试
-│   └── knowledge/            # 技术元数据
-├── image/                    # README 演示图片
-├── build.sh                  # 构建脚本
-└── README.md                 # 项目文档
+│   ├── keymgr/                 # 密钥派生 + 确定性构建支持
+│   └── knowledge/              # Evasion 技术元数据 (T001-T007)
+└── image/                      # 文档截图
 ```
+
+---
+
+## 测试
+
+```bash
+go test ./...
+```
+
+两层测试策略：
+
+- 单元测试：配置校验、确定性随机源、env-bind 解析、模板数据构造
+- 编译测试：渲染代表性模板组合（含 T001-T007 全量组合）→ 交叉编译 `windows/amd64`
+
+---
+
+## 开发
+
+添加新功能的检查清单：
+
+1. `Config` 结构体 + `registerFlags`
+2. `Validate` + `Features`
+3. `TemplateData` + 对应模板
+4. `generator_test.go` 编译测试
+5. README 功能矩阵
+
+```bash
+gofmt -w generator.go generator_test.go internal/keymgr/keymgr.go internal/knowledge/techniques.go
+go test ./...
+```
+
+---
+
+## 截图
+
+| 生成过程 | 检测效果 | 执行效果 |
+|---|---|---|
+| ![](image/img_1.png) | ![](image/img_2.png) | ![](image/img.png) |
+
+---
 
 ## 已知限制
 
-- 交叉编译测试能证明生成代码可编译，但不等于在所有 Windows 版本上都完成运行时验证。
-- env-bind 模式依赖运行时环境特征值与生成时声明完全一致。
-- 新模板组合应保守扩展，并配套编译测试。
-- 加密封装主要用于降低简单静态分析的可见性；当分析者完全控制样本和运行环境时，不应把它视为强机密保护。
-- 本项目不承诺通用绕过、隐蔽或检测结果。
+- 编译测试不等于运行时验证，不覆盖所有 Windows 版本
+- env-bind 要求运行时特征值与生成时声明完全一致
+- 加密封装降低简单静态分析可见性，不构成强机密保护
+- 不承诺通用绕过或特定检测结果
+
+---
 
 ## 免责声明
 
-**此工具仅限于授权的渗透测试、安全研究和教育目的。**
+本工具仅限授权渗透测试、安全研究和教育用途。严禁用于非法活动。作者不对滥用导致的任何后果承担责任。使用即表示同意。
 
-严禁将此工具用于任何非法活动。本项目作者不对任何因滥用或非法使用此工具导致的直接或间接后果承担责任。使用者应对自己的所有行为负责。
+---
 
-**使用本工具即表示您已阅读、理解并同意遵守此免责声明。**
+## 社区
 
-## 支持项目
+[![Star History](https://api.star-history.com/svg?repos=watanabe-hsad/GoPhantom&type=date&legend=top-left)](https://www.star-history.com/#watanabe-hsad/GoPhantom&type=date&legend=top-left)
 
-如果这个项目对您有帮助，欢迎点一个 Star 支持一下。
+QQ 交流群：
 
-有问题或建议也欢迎提交 Issue 或 Pull Request。
+![QQ](image/QQgroup.jpg)
 
-## Star History
-
-[![Star History Chart](https://api.star-history.com/svg?repos=watanabe-hsad/GoPhantom&type=date&legend=top-left)](https://www.star-history.com/#watanabe-hsad/GoPhantom&type=date&legend=top-left)
-
-## 交流群
-
-欢迎加入 QQ 群交流讨论，一起探索红队技术与工程化实践。
-
-![QQ交流群](image/QQgroup.jpg)
+Issue 和 Pull Request 随时欢迎。
 
 ## License
 

